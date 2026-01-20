@@ -17,10 +17,12 @@ struct BenchmarkResult {
 }
 
 impl BenchmarkResult {
+    #[allow(dead_code)]
     fn expansion_ratio(&self) -> f64 {
         self.svm_instructions as f64 / self.rv_instructions as f64
     }
 
+    #[allow(dead_code)]
     fn cu_per_rv_instruction(&self) -> f64 {
         self.compute_units as f64 / self.rv_instructions as f64
     }
@@ -364,18 +366,24 @@ fn main() {
         });
     }
 
-    // Print compilation statistics
+    // Print compilation statistics with compute unit data
     println!("Compilation Statistics:");
-    println!("| Function     | RV32IM Insts | SVM Insts | Expansion |");
-    println!("|--------------|--------------|-----------|-----------|");
-    let unique_funcs: Vec<_> = results.iter()
-        .map(|r| (r.name, r.rv_instructions, r.svm_instructions))
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-    for (name, rv, svm) in &unique_funcs {
-        println!("| {:12} | {:>12} | {:>9} | {:>8.2}x |",
-                 name, rv, svm, *svm as f64 / *rv as f64);
+    println!("| Function     | RV32IM Insts | SVM Insts | Expansion | Total CU | Mean CU/Inst |");
+    println!("|--------------|--------------|-----------|-----------|----------|--------------|");
+
+    // Group results by function to calculate totals
+    let mut func_stats: std::collections::HashMap<&str, (usize, usize, u64, usize)> = std::collections::HashMap::new();
+    for r in &results {
+        let entry = func_stats.entry(r.name).or_insert((r.rv_instructions, r.svm_instructions, 0, 0));
+        entry.2 += r.compute_units;  // sum of CU
+        entry.3 += 1;                // count
+    }
+
+    for (name, (rv, svm, total_cu, count)) in &func_stats {
+        let expansion = *svm as f64 / *rv as f64;
+        let mean_cu_per_inst = *total_cu as f64 / (*rv * count) as f64;
+        println!("| {:12} | {:>12} | {:>9} | {:>8.2}x | {:>8} | {:>12.2} |",
+                 name, rv, svm, expansion, total_cu, mean_cu_per_inst);
     }
     println!();
 
