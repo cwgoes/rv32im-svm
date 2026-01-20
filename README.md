@@ -118,25 +118,25 @@ cargo run -- program.bin --stats
 
 Compilation statistics for various mathematical functions:
 
-| Function | RV32IM Insts | SVM Insts | Expansion |
-|----------|--------------|-----------|-----------|
-| factorial | 8 | 68 | 8.50× |
-| fibonacci | 13 | 109 | 8.38× |
-| gcd | 6 | 66 | 11.00× |
-| power | 7 | 59 | 8.43× |
-| sum_squares | 9 | 81 | 9.00× |
-| isqrt | 8 | 67 | 8.38× |
-| modpow | 13 | 146 | 11.23× |
+| Function | RV32IM Insts | SVM Insts | Expansion | Total CU | Mean CU/Inst |
+|----------|--------------|-----------|-----------|----------|--------------|
+| factorial | 8 | 33 | 4.12x | 1,163 | 48.46 |
+| fibonacci | 13 | 47 | 3.62x | 2,670 | 68.46 |
+| gcd | 6 | 41 | 6.83x | 1,149 | 63.83 |
+| power | 7 | 29 | 4.14x | 1,154 | 54.95 |
+| sum_squares | 9 | 37 | 4.11x | 11,196 | 414.67 |
+| isqrt | 8 | 36 | 4.50x | 59,070 | 2,461.25 |
+| modpow | 13 | 71 | 5.46x | 2,201 | 56.44 |
 
 #### Execution Results
 
 | Function | Input | Result | Compute Units |
 |----------|-------|--------|---------------|
-| factorial | 10 | 3,628,800 | 701 |
-| fibonacci | 20 | 6,765 | 1,818 |
-| gcd | 1071, 462 | 21 | 365 |
-| power | 2^10 | 1,024 | 684 |
-| modpow | 7^20 mod 10^9+7 | 868,674,437 | 1,014 |
+| factorial | 10 | 3,628,800 | 529 |
+| fibonacci | 20 | 6,765 | 1,180 |
+| gcd | 1071, 462 | 21 | 293 |
+| power | 2^10 | 1,024 | 510 |
+| modpow | 7^20 mod 10^9+7 | 868,674,437 | 785 |
 
 ### SHA-256 Benchmark
 
@@ -151,10 +151,10 @@ riscv64-linux-gnu-gcc -march=rv32im -mabi=ilp32 -O2 -c sha256.c
 | Metric | Value |
 |--------|-------|
 | RISC-V Instructions | 263 |
-| SVM Instructions | 2,624 |
-| Expansion Ratio | 9.98× |
-| Compute Units | 108,390 |
-| CU per rv32im instruction | 412.13 |
+| SVM Instructions | 936 |
+| Expansion Ratio | 3.56x |
+| Compute Units | 70,527 |
+| CU per rv32im instruction | 268.16 |
 
 ```
 SHA-256("abc") first word: 0xba7816bf ✓
@@ -164,13 +164,13 @@ SHA-256("abc") first word: 0xba7816bf ✓
 
 | Metric | Value |
 |--------|-------|
-| Mean instruction expansion | 9.31× |
-| Mean CU per rv32im instruction | ~65-100 (control flow) |
-| SHA-256 CU per rv32im instruction | 412 (memory-intensive) |
+| Mean instruction expansion | 3.56x - 6.83x |
+| Mean CU per rv32im instruction | 48-68 (control flow) |
+| SHA-256 CU per rv32im instruction | 268 (memory-intensive) |
 
 The overhead varies based on the instruction mix:
-- **Control-flow heavy** (branches, jumps): ~65-80 CU/inst
-- **Memory-intensive** (many loads/stores): ~400+ CU/inst
+- **Control-flow heavy** (branches, jumps): ~50-70 CU/inst
+- **Memory-intensive** (many loads/stores): ~270+ CU/inst
 
 This is because each RISC-V register access requires loading/storing from SVM memory.
 
