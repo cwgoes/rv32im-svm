@@ -208,9 +208,19 @@ impl Compiler {
         use Instruction::*;
 
         match inst {
-            // R-type ALU operations
+            // R-type ALU operations - optimize common zero-operand patterns
             Add { rd, rs1, rs2 } => self.compile_add(rd, rs1, rs2),
+            // SUB rd, zero, rs2 = negation
+            Sub { rd, rs1, rs2 } if rs1 == Register::ZERO => self.compile_neg(rd, rs2),
             Sub { rd, rs1, rs2 } => self.compile_r_type_svm(rd, rs1, rs2, opcodes::SUB),
+            // XOR/OR with zero = move
+            Xor { rd, rs1, rs2 } if rs2 == Register::ZERO => self.compile_move(rd, rs1),
+            Xor { rd, rs1, rs2 } if rs1 == Register::ZERO => self.compile_move(rd, rs2),
+            Or { rd, rs1, rs2 } if rs2 == Register::ZERO => self.compile_move(rd, rs1),
+            Or { rd, rs1, rs2 } if rs1 == Register::ZERO => self.compile_move(rd, rs2),
+            // AND with zero = 0
+            And { rd, rs1: _, rs2 } if rs2 == Register::ZERO => self.compile_load_zero(rd),
+            And { rd, rs1, rs2: _ } if rs1 == Register::ZERO => self.compile_load_zero(rd),
             Xor { rd, rs1, rs2 } => self.compile_r_type_svm(rd, rs1, rs2, opcodes::XOR),
             Or { rd, rs1, rs2 } => self.compile_r_type_svm(rd, rs1, rs2, opcodes::OR),
             And { rd, rs1, rs2 } => self.compile_r_type_svm(rd, rs1, rs2, opcodes::AND),
@@ -244,9 +254,17 @@ impl Compiler {
             Sw { rs1, rs2, imm } => self.compile_store(rs1, rs2, imm, MemorySize::Word),
 
             // Branch instructions
-            // For BEQ/BNE, sign extension doesn't matter (comparing for equality)
-            // For BLT/BGE (signed), need sign-extended values
-            // For BLTU/BGEU (unsigned), need zero-extended (raw) values
+            // Optimize comparisons with zero using immediate comparison
+            Beq { rs1, rs2, imm } if rs2 == Register::ZERO => self.compile_branch_zero(rs1, imm, opcodes::JEQ),
+            Bne { rs1, rs2, imm } if rs2 == Register::ZERO => self.compile_branch_zero(rs1, imm, opcodes::JNE),
+            Beq { rs1, rs2, imm } if rs1 == Register::ZERO => self.compile_branch_zero(rs2, imm, opcodes::JEQ),
+            Bne { rs1, rs2, imm } if rs1 == Register::ZERO => self.compile_branch_zero(rs2, imm, opcodes::JNE),
+            // For BLT/BGE with zero, we can also optimize (checking against 0)
+            Blt { rs1, rs2, imm } if rs2 == Register::ZERO => self.compile_branch_zero(rs1, imm, opcodes::JSLT),
+            Bge { rs1, rs2, imm } if rs2 == Register::ZERO => self.compile_branch_zero(rs1, imm, opcodes::JSGE),
+            Bltu { rs1, rs2, imm } if rs2 == Register::ZERO => self.compile_branch_zero_raw(rs1, imm, opcodes::JLT),
+            Bgeu { rs1, rs2, imm } if rs2 == Register::ZERO => self.compile_branch_zero_raw(rs1, imm, opcodes::JGE),
+            // General cases
             Beq { rs1, rs2, imm } => self.compile_branch_raw(rs1, rs2, imm, opcodes::JEQ),
             Bne { rs1, rs2, imm } => self.compile_branch_raw(rs1, rs2, imm, opcodes::JNE),
             Blt { rs1, rs2, imm } => self.compile_branch(rs1, rs2, imm, opcodes::JSLT),
@@ -294,6 +312,33 @@ impl Compiler {
         }
     }
 
+    // Optimized move: rd = rs
+    fn compile_move(&mut self, rd: Register, rs: Register) -> CompilerResult<()> {
+        if rs == Register::ZERO {
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
+        } else {
+            self.load_rv_reg_raw(SvmRegister::R1, rs);
+        }
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // Load zero into register
+    fn compile_load_zero(&mut self, rd: Register) -> CompilerResult<()> {
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // Negation: rd = -rs (SUB rd, zero, rs)
+    // No sign extension needed - neg32 produces correct lower 32 bits
+    fn compile_neg(&mut self, rd: Register, rs: Register) -> CompilerResult<()> {
+        self.load_rv_reg_raw(SvmRegister::R1, rs);
+        self.output.push(SvmInstruction::neg32(SvmRegister::R1));
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
     // Special handling for ADD (handles move pseudo-instruction)
     fn compile_add(&mut self, rd: Register, rs1: Register, rs2: Register) -> CompilerResult<()> {
         // ADD rd, rs1, zero is a move: rd = rs1
@@ -302,8 +347,8 @@ impl Compiler {
                 // ADD rd, zero, zero = load 0
                 self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
             } else {
-                // Just copy rs1 to rd
-                self.load_rv_reg(SvmRegister::R1, rs1);
+                // Just copy rs1 to rd - raw load is fine (preserves 32-bit value)
+                self.load_rv_reg_raw(SvmRegister::R1, rs1);
             }
             self.store_rv_reg(rd, SvmRegister::R1);
             return Ok(());
@@ -311,7 +356,7 @@ impl Compiler {
 
         // ADD rd, zero, rs2 is also a move: rd = rs2
         if rs1 == Register::ZERO {
-            self.load_rv_reg(SvmRegister::R1, rs2);
+            self.load_rv_reg_raw(SvmRegister::R1, rs2);
             self.store_rv_reg(rd, SvmRegister::R1);
             return Ok(());
         }
@@ -322,25 +367,21 @@ impl Compiler {
 
     // R-type using SVM opcodes directly
     // Uses raw loads since alu32 only uses lower 32 bits
+    // No sign extension needed - lower 32 bits are correct and that's what we store
     fn compile_r_type_svm(&mut self, rd: Register, rs1: Register, rs2: Register, op: u8) -> CompilerResult<()> {
         self.load_rv_reg_raw(SvmRegister::R1, rs1);
         self.load_rv_reg_raw(SvmRegister::R2, rs2);
         self.output.push(SvmInstruction::alu32_reg(op, SvmRegister::R1, SvmRegister::R2));
-        // Sign extend result
-        self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
-        self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
         self.store_rv_reg(rd, SvmRegister::R1);
         Ok(())
     }
 
     // I-type ALU operations
     // Uses raw load since alu32 only uses lower 32 bits
+    // No sign extension needed - lower 32 bits are correct and that's what we store
     fn compile_i_type(&mut self, rd: Register, rs1: Register, imm: i32, op: u8) -> CompilerResult<()> {
         self.load_rv_reg_raw(SvmRegister::R1, rs1);
         self.output.push(SvmInstruction::alu32_imm(op, SvmRegister::R1, imm));
-        // Sign extend result
-        self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
-        self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
         self.store_rv_reg(rd, SvmRegister::R1);
         Ok(())
     }
@@ -358,21 +399,13 @@ impl Compiler {
 
         self.load_rv_reg_raw(SvmRegister::R1, rs1);
         self.output.push(SvmInstruction::add32_imm(SvmRegister::R1, imm));
-        // Sign extend result
-        self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
-        self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
+        // No sign extension needed - lower 32 bits are correct and that's what we store
         self.store_rv_reg(rd, SvmRegister::R1);
         Ok(())
     }
 
     // Shift operations with register
     fn compile_shift(&mut self, rd: Register, rs1: Register, rs2: Register, right: bool, arithmetic: bool) -> CompilerResult<()> {
-        // For SRA, we need sign-extended input; for SLL/SRL, raw is fine
-        if arithmetic {
-            self.load_rv_reg(SvmRegister::R1, rs1);
-        } else {
-            self.load_rv_reg_raw(SvmRegister::R1, rs1);
-        }
         // Shift amount doesn't need sign extension - masked to 5 bits anyway
         self.load_rv_reg_raw(SvmRegister::R2, rs2);
         // Mask shift amount to 5 bits
@@ -380,53 +413,53 @@ impl Compiler {
 
         if right {
             if arithmetic {
-                // For arithmetic right shift, first sign extend to 64-bit, shift, then truncate
-                self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
-                self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
+                // SRA: load_rv_reg provides sign-extended value, shift directly
+                // Result is sign-extended (arithmetic shift preserves sign)
+                self.load_rv_reg(SvmRegister::R1, rs1);
                 self.output.push(SvmInstruction::arsh64_reg(SvmRegister::R1, SvmRegister::R2));
             } else {
-                // Logical right shift - zero extend first by shifting left then right
+                // SRL: load raw, zero extend, then logical shift
+                // Result is zero-extended in lower 32 bits
+                self.load_rv_reg_raw(SvmRegister::R1, rs1);
                 self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
                 self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, 32));
                 self.output.push(SvmInstruction::rsh64_reg(SvmRegister::R1, SvmRegister::R2));
             }
         } else {
+            // SLL: raw load, shift left
+            // Lower 32 bits contain correct result
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
             self.output.push(SvmInstruction::lsh64_reg(SvmRegister::R1, SvmRegister::R2));
         }
 
-        // Truncate to 32-bit and sign extend
-        self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
-        self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
+        // Store lower 32 bits directly - no truncation needed
         self.store_rv_reg(rd, SvmRegister::R1);
         Ok(())
     }
 
-    // Shift operations with immediate
+    // Shift operations with immediate - optimized by combining consecutive shifts
     fn compile_shift_imm(&mut self, rd: Register, rs1: Register, shamt: u32, right: bool, arithmetic: bool) -> CompilerResult<()> {
-        // For SRA, we need sign-extended input; for SLL/SRL, raw is fine
-        // SRL explicitly zero-extends below, SLL result is truncated
         self.load_rv_reg_raw(SvmRegister::R1, rs1);
         let shamt = (shamt & 0x1f) as i32;
 
         if right {
             if arithmetic {
-                // Sign extend first, then arithmetic shift
+                // SRAI: Sign extend, then arithmetic shift - combine the two arithmetic shifts
+                // After arsh64, result is already sign-extended in lower 32 bits
                 self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
-                self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
-                self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, shamt));
+                self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32 + shamt));
             } else {
-                // Zero extend (lsh then rsh) and logical shift
+                // SRLI: Zero extend, then logical shift - combine the two logical shifts
+                // After rsh64, result is zero-extended in lower 32 bits
                 self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
-                self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, 32));
-                self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, shamt));
+                self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, 32 + shamt));
             }
         } else {
-            self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, shamt));
+            // SLLI: Shift left, then truncate - combine the two left shifts
+            self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32 + shamt));
+            self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
         }
 
-        // Truncate to 32-bit and sign extend
-        self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
-        self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
         self.store_rv_reg(rd, SvmRegister::R1);
         Ok(())
     }
@@ -491,18 +524,24 @@ impl Compiler {
     // Load instructions
     fn compile_load(&mut self, rd: Register, rs1: Register, imm: i32, size: MemorySize, sign_extend: bool) -> CompilerResult<()> {
         // Calculate address: base + imm + memory_base
-        // Use raw load for address - no sign extension needed for address calculation
-        self.load_rv_reg_raw(SvmRegister::R1, rs1);
-        // Combine imm and memory_base into single add if possible
         let total_offset = imm.wrapping_add(self.config.memory_base as i32);
-        if total_offset != 0 {
-            self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, total_offset));
+
+        // Optimize: if rs1 is x0, just use the immediate as address
+        if rs1 == Register::ZERO {
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, total_offset));
+        } else {
+            // Use raw load for address - no sign extension needed
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+            if total_offset != 0 {
+                self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, total_offset));
+            }
         }
 
         // Load value
         self.output.push(SvmInstruction::ldx(size, SvmRegister::R2, SvmRegister::R1, 0));
 
-        // Sign or zero extend to 32 bits
+        // Sign extend to 32 bits for sub-word loads (byte, half)
+        // Word loads don't need sign extension - lower 32 bits are correct
         if sign_extend {
             match size {
                 MemorySize::Byte => {
@@ -513,11 +552,9 @@ impl Compiler {
                     self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R2, 48));
                     self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R2, 48));
                 }
-                MemorySize::Word => {
-                    self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R2, 32));
-                    self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R2, 32));
+                MemorySize::Word | MemorySize::DWord => {
+                    // No sign extension needed - lower 32 bits are already correct
                 }
-                MemorySize::DWord => {}
             }
         }
 
@@ -527,12 +564,18 @@ impl Compiler {
 
     // Store instructions
     fn compile_store(&mut self, rs1: Register, rs2: Register, imm: i32, size: MemorySize) -> CompilerResult<()> {
-        // Calculate address - use raw load (no sign extension needed for addresses)
-        self.load_rv_reg_raw(SvmRegister::R1, rs1);
-        // Combine imm and memory_base into single add if possible
+        // Calculate address
         let total_offset = imm.wrapping_add(self.config.memory_base as i32);
-        if total_offset != 0 {
-            self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, total_offset));
+
+        // Optimize: if rs1 is x0, just use the immediate as address
+        if rs1 == Register::ZERO {
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, total_offset));
+        } else {
+            // Use raw load (no sign extension needed for addresses)
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+            if total_offset != 0 {
+                self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, total_offset));
+            }
         }
 
         // Load value to store - raw load is fine, we store lower bits
@@ -581,6 +624,40 @@ impl Compiler {
         Ok(())
     }
 
+    // Branch comparing with zero (signed) - optimized to use immediate comparison
+    fn compile_branch_zero(&mut self, rs1: Register, imm: i32, jmp_op: u8) -> CompilerResult<()> {
+        self.load_rv_reg(SvmRegister::R1, rs1);
+
+        // Calculate target instruction index
+        let inst_offset = imm / 4;
+        let target_idx = (self.rv_pc as i32 + inst_offset) as usize;
+
+        // Use immediate comparison with 0 - saves loading a register
+        let jmp_idx = self.output.len();
+        self.output.push(SvmInstruction::jmp_imm(jmp_op, SvmRegister::R1, 0, 0));
+
+        // Record fixup
+        self.branch_fixups.push((jmp_idx, target_idx));
+        Ok(())
+    }
+
+    // Branch comparing with zero (raw/unsigned) - optimized to use immediate comparison
+    fn compile_branch_zero_raw(&mut self, rs1: Register, imm: i32, jmp_op: u8) -> CompilerResult<()> {
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
+
+        // Calculate target instruction index
+        let inst_offset = imm / 4;
+        let target_idx = (self.rv_pc as i32 + inst_offset) as usize;
+
+        // Use immediate comparison with 0 - saves loading a register
+        let jmp_idx = self.output.len();
+        self.output.push(SvmInstruction::jmp_imm(jmp_op, SvmRegister::R1, 0, 0));
+
+        // Record fixup
+        self.branch_fixups.push((jmp_idx, target_idx));
+        Ok(())
+    }
+
     // JAL instruction
     fn compile_jal(&mut self, rd: Register, imm: i32) -> CompilerResult<()> {
         // Save return address (next instruction's address in RISC-V terms)
@@ -611,7 +688,8 @@ impl Compiler {
     // JALR instruction
     fn compile_jalr(&mut self, rd: Register, rs1: Register, imm: i32) -> CompilerResult<()> {
         // Calculate target address in bytes
-        self.load_rv_reg(SvmRegister::R1, rs1);
+        // Raw load is fine - we just need the address value
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
         self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, imm));
         // Clear lowest bit (per RISC-V spec)
         self.output.push(SvmInstruction::and64_imm(SvmRegister::R1, !1));
@@ -681,14 +759,12 @@ impl Compiler {
         Ok(())
     }
 
-    // MUL instruction
+    // MUL instruction - mul32 only uses lower 32 bits, so raw loads work
     fn compile_mul(&mut self, rd: Register, rs1: Register, rs2: Register) -> CompilerResult<()> {
-        self.load_rv_reg(SvmRegister::R1, rs1);
-        self.load_rv_reg(SvmRegister::R2, rs2);
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        self.load_rv_reg_raw(SvmRegister::R2, rs2);
         self.output.push(SvmInstruction::mul32_reg(SvmRegister::R1, SvmRegister::R2));
-        // Sign extend
-        self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
-        self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
+        // No sign extension needed - mul32 produces correct lower 32 bits
         self.store_rv_reg(rd, SvmRegister::R1);
         Ok(())
     }
@@ -718,11 +794,9 @@ impl Compiler {
         // 64-bit multiply
         self.output.push(SvmInstruction::mul64_reg(SvmRegister::R1, SvmRegister::R2));
 
-        // Get upper 32 bits
+        // Get upper 32 bits - these are already in the lower 32 bits after shift
+        // No sign extension needed - we only store lower 32 bits
         self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, 32));
-        // Sign extend result for storage
-        self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
-        self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
 
         self.store_rv_reg(rd, SvmRegister::R1);
         Ok(())
@@ -730,8 +804,15 @@ impl Compiler {
 
     // DIV/DIVU instruction
     fn compile_div(&mut self, rd: Register, rs1: Register, rs2: Register, signed: bool) -> CompilerResult<()> {
-        self.load_rv_reg(SvmRegister::R1, rs1);
-        self.load_rv_reg(SvmRegister::R2, rs2);
+        // For unsigned division, raw loads are fine (div32 uses lower 32 bits)
+        // For signed division, we need sign-extended for overflow check
+        if signed {
+            self.load_rv_reg(SvmRegister::R1, rs1);
+            self.load_rv_reg(SvmRegister::R2, rs2);
+        } else {
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+            self.load_rv_reg_raw(SvmRegister::R2, rs2);
+        }
 
         // Check for division by zero - return -1 for signed, 0xFFFFFFFF for unsigned
         self.output.push(SvmInstruction::jmp_imm(opcodes::JNE, SvmRegister::R2, 0, 2));
@@ -765,18 +846,22 @@ impl Compiler {
         let current = self.output.len();
         self.output.instructions[skip_idx].offset = (current - skip_idx - 1) as i16;
 
-        // Sign extend result
-        self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
-        self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
-
+        // No sign extension needed - div32 produces correct lower 32 bits
         self.store_rv_reg(rd, SvmRegister::R1);
         Ok(())
     }
 
     // REM/REMU instruction
     fn compile_rem(&mut self, rd: Register, rs1: Register, rs2: Register, signed: bool) -> CompilerResult<()> {
-        self.load_rv_reg(SvmRegister::R1, rs1);
-        self.load_rv_reg(SvmRegister::R2, rs2);
+        // For unsigned remainder, raw loads are fine (mod32 uses lower 32 bits)
+        // For signed remainder, we need sign-extended for overflow check
+        if signed {
+            self.load_rv_reg(SvmRegister::R1, rs1);
+            self.load_rv_reg(SvmRegister::R2, rs2);
+        } else {
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+            self.load_rv_reg_raw(SvmRegister::R2, rs2);
+        }
 
         // Check for division by zero - return dividend
         // If R2 != 0, skip 1 instruction (the ja that jumps to end)
@@ -832,10 +917,7 @@ impl Compiler {
         let current = self.output.len();
         self.output.instructions[skip_to_end_idx].offset = (current - skip_to_end_idx - 1) as i16;
 
-        // Sign extend result
-        self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
-        self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
-
+        // No sign extension needed - result is in lower 32 bits
         self.store_rv_reg(rd, SvmRegister::R1);
         Ok(())
     }

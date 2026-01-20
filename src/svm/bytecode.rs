@@ -389,6 +389,11 @@ impl SvmInstruction {
         Self::alu64_imm(opcodes::NEG, dst, 0)
     }
 
+    /// Negate (32-bit): dst = -dst (operates on lower 32 bits)
+    pub fn neg32(dst: SvmRegister) -> Self {
+        Self::alu32_imm(opcodes::NEG, dst, 0)
+    }
+
     // 32-bit ALU variants
     pub fn add32_reg(dst: SvmRegister, src: SvmRegister) -> Self {
         Self::alu32_reg(opcodes::ADD, dst, src)
