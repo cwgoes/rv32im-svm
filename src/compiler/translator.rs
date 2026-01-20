@@ -71,6 +71,10 @@ pub struct Compiler {
     rv_pc: usize,
     /// Pending branch fixups: (svm_index, rv_target_index)
     branch_fixups: Vec<(usize, usize)>,
+    /// Return sites: RV byte addresses that can be return targets (after JAL)
+    return_sites: Vec<usize>,
+    /// JALR dispatch fixups: (svm_index) - jump instructions that need dispatch table target
+    jalr_fixups: Vec<usize>,
 }
 
 impl Compiler {
@@ -88,6 +92,8 @@ impl Compiler {
             rv_instructions: Vec::new(),
             rv_pc: 0,
             branch_fixups: Vec::new(),
+            return_sites: Vec::new(),
+            jalr_fixups: Vec::new(),
         }
     }
 
@@ -97,6 +103,8 @@ impl Compiler {
         self.output = SvmProgram::new();
         self.pc_map.clear();
         self.branch_fixups.clear();
+        self.return_sites.clear();
+        self.jalr_fixups.clear();
 
         // First pass: emit prologue
         self.emit_prologue();
@@ -114,6 +122,9 @@ impl Compiler {
 
         // Third pass: fix up branches
         self.fixup_branches()?;
+
+        // Fourth pass: emit return dispatch table if needed
+        self.emit_return_dispatch()?;
 
         // Emit epilogue (return)
         self.emit_epilogue();
@@ -315,8 +326,9 @@ impl Compiler {
                 self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
                 self.output.push(SvmInstruction::arsh64_reg(SvmRegister::R1, SvmRegister::R2));
             } else {
-                // Logical right shift - zero extend first
-                self.output.push(SvmInstruction::and64_imm(SvmRegister::R1, -1i32)); // Keep lower 32 bits
+                // Logical right shift - zero extend first by shifting left then right
+                self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
+                self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, 32));
                 self.output.push(SvmInstruction::rsh64_reg(SvmRegister::R1, SvmRegister::R2));
             }
         } else {
@@ -342,8 +354,9 @@ impl Compiler {
                 self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
                 self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, shamt));
             } else {
-                // Zero extend and logical shift
-                self.output.push(SvmInstruction::and64_imm(SvmRegister::R1, -1i32));
+                // Zero extend (lsh then rsh) and logical shift
+                self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
+                self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, 32));
                 self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, shamt));
             }
         } else {
@@ -471,9 +484,17 @@ impl Compiler {
     // JAL instruction
     fn compile_jal(&mut self, rd: Register, imm: i32) -> CompilerResult<()> {
         // Save return address (next instruction's address in RISC-V terms)
-        let return_addr = ((self.rv_pc + 1) * 4) as i32;
-        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, return_addr));
+        let return_addr = (self.rv_pc + 1) * 4;
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, return_addr as i32));
         self.store_rv_reg(rd, SvmRegister::R1);
+
+        // Record this as a potential return site (for JALR dispatch)
+        if rd != Register::ZERO {
+            // Only record if we're saving the return address
+            if !self.return_sites.contains(&(self.rv_pc + 1)) {
+                self.return_sites.push(self.rv_pc + 1);
+            }
+        }
 
         // Calculate target
         let inst_offset = imm / 4;
@@ -489,35 +510,26 @@ impl Compiler {
 
     // JALR instruction
     fn compile_jalr(&mut self, rd: Register, rs1: Register, imm: i32) -> CompilerResult<()> {
-        // Calculate target address
+        // Calculate target address in bytes
         self.load_rv_reg(SvmRegister::R1, rs1);
         self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, imm));
         // Clear lowest bit (per RISC-V spec)
         self.output.push(SvmInstruction::and64_imm(SvmRegister::R1, !1));
 
-        // Save return address
-        let return_addr = ((self.rv_pc + 1) * 4) as i32;
-        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R2, return_addr));
-        self.store_rv_reg(rd, SvmRegister::R2);
+        // Save return address (for calls, not returns)
+        if rd != Register::ZERO {
+            let return_addr = ((self.rv_pc + 1) * 4) as i32;
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R2, return_addr));
+            self.store_rv_reg(rd, SvmRegister::R2);
+        }
 
-        // For JALR, we need dynamic dispatch which is complex in SVM
-        // For now, we'll implement a simple lookup table approach
-        // Store target address and let the execution engine handle it
-        // This is a simplification - a full implementation would need a jump table
+        // R1 now contains the target byte address
+        // We'll jump to the dispatch table which will handle the dynamic jump
+        // Store jump index for later fixup
+        let jmp_idx = self.output.len();
+        self.output.push(SvmInstruction::ja(0)); // Will be fixed up to point to dispatch table
+        self.jalr_fixups.push(jmp_idx);
 
-        // Convert byte address to instruction index
-        self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, 2));
-
-        // Check if target is 0 (return/exit)
-        self.output.push(SvmInstruction::jmp_imm(opcodes::JNE, SvmRegister::R1, 0, 1));
-        self.output.push(SvmInstruction::exit());
-
-        // For non-zero targets, we need computed goto support
-        // SVM doesn't have computed goto, so we need a dispatch table
-        // For simple cases, we'll emit a series of comparisons
-
-        // This is a simplified implementation that only handles returns properly
-        // A full implementation would need more sophisticated handling
         Ok(())
     }
 
@@ -742,6 +754,61 @@ impl Compiler {
 
             self.output.instructions[jmp_idx].offset = offset as i16;
         }
+        Ok(())
+    }
+
+    /// Emit return dispatch table for JALR instructions
+    ///
+    /// This creates a series of comparisons against known return sites
+    /// and jumps to the appropriate SVM instruction.
+    fn emit_return_dispatch(&mut self) -> CompilerResult<()> {
+        if self.jalr_fixups.is_empty() {
+            return Ok(());
+        }
+
+        // Record start of dispatch table
+        let dispatch_start = self.output.len();
+
+        // R1 contains the target byte address from JALR
+        // We need to compare against each return site
+
+        // First check for 0 (exit)
+        self.output.push(SvmInstruction::jmp_imm(opcodes::JNE, SvmRegister::R1, 0, 1));
+        self.output.push(SvmInstruction::exit());
+
+        // For each return site, emit comparison and jump
+        for &return_rv_idx in &self.return_sites.clone() {
+            let return_byte_addr = (return_rv_idx * 4) as i32;
+            let target_svm_idx = self.pc_map.get(&return_rv_idx)
+                .ok_or_else(|| CompilerError::InvalidBranchTarget(return_rv_idx as i32))?;
+
+            // Compare R1 with return address
+            self.output.push(SvmInstruction::jmp_imm(opcodes::JNE, SvmRegister::R1, return_byte_addr, 1));
+
+            // Emit jump to target SVM instruction
+            let jmp_idx = self.output.len();
+            self.output.push(SvmInstruction::ja(0));
+
+            // Calculate offset for the jump
+            let offset = (*target_svm_idx as i64) - (jmp_idx as i64) - 1;
+            if offset < i16::MIN as i64 || offset > i16::MAX as i64 {
+                return Err(CompilerError::InvalidBranchTarget(return_rv_idx as i32));
+            }
+            self.output.instructions[jmp_idx].offset = offset as i16;
+        }
+
+        // If no match found, exit (shouldn't happen in well-formed programs)
+        self.output.push(SvmInstruction::exit());
+
+        // Fix up all JALR jumps to point to dispatch table
+        for jmp_idx in &self.jalr_fixups.clone() {
+            let offset = (dispatch_start as i64) - (*jmp_idx as i64) - 1;
+            if offset < i16::MIN as i64 || offset > i16::MAX as i64 {
+                return Err(CompilerError::InvalidBranchTarget(dispatch_start as i32));
+            }
+            self.output.instructions[*jmp_idx].offset = offset as i16;
+        }
+
         Ok(())
     }
 }

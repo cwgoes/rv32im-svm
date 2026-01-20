@@ -114,55 +114,65 @@ cargo run -- program.bin --stats
 
 ## Benchmarks
 
-### Factorial Function
+### Mathematical Functions
 
-The factorial function compiled from C:
+Compilation statistics for various mathematical functions:
 
-```c
-int factorial(int n) {
-    int result = 1;
-    while (n > 1) {
-        result *= n;
-        n--;
-    }
-    return result;
-}
-```
-
-#### Compilation Statistics
-
-| Metric | Value |
-|--------|-------|
-| RISC-V Instructions | 8 |
-| SVM Instructions | 68 |
-| Expansion Ratio | 8.50× |
-| Base Compute Cost | 133 CUs |
+| Function | RV32IM Insts | SVM Insts | Expansion |
+|----------|--------------|-----------|-----------|
+| factorial | 8 | 68 | 8.50× |
+| fibonacci | 13 | 109 | 8.38× |
+| gcd | 6 | 66 | 11.00× |
+| power | 7 | 59 | 8.43× |
+| sum_squares | 9 | 81 | 9.00× |
+| isqrt | 8 | 67 | 8.38× |
+| modpow | 13 | 146 | 11.23× |
 
 #### Execution Results
 
-| n | factorial(n) | Compute Units |
-|---|--------------|---------------|
-| 3 | 6 | 211 |
-| 5 | 120 | 351 |
-| 7 | 5,040 | 491 |
-| 10 | 3,628,800 | 701 |
-| 12 | 479,001,600 | 841 |
+| Function | Input | Result | Compute Units |
+|----------|-------|--------|---------------|
+| factorial | 10 | 3,628,800 | 701 |
+| fibonacci | 20 | 6,765 | 1,818 |
+| gcd | 1071, 462 | 21 | 365 |
+| power | 2^10 | 1,024 | 684 |
+| modpow | 7^20 mod 10^9+7 | 868,674,437 | 1,014 |
 
-#### Compute Cost Breakdown
+### SHA-256 Benchmark
 
-Each loop iteration consumes approximately **70 compute units**:
-- Register load/store operations: ~40 CUs
-- Branch evaluation: ~10 CUs
-- Multiplication: 10 CUs
-- Arithmetic operations: ~10 CUs
+Real-world benchmark using SHA-256 compiled from C to rv32im using GCC:
 
-### Cost Formula
+```bash
+riscv64-linux-gnu-gcc -march=rv32im -mabi=ilp32 -O2 -c sha256.c
+```
 
-For factorial(n), the approximate compute cost is:
+#### SHA-256 Statistics
+
+| Metric | Value |
+|--------|-------|
+| RISC-V Instructions | 263 |
+| SVM Instructions | 2,624 |
+| Expansion Ratio | 9.98× |
+| Compute Units | 108,390 |
+| CU per rv32im instruction | 412.13 |
 
 ```
-CU ≈ 133 + 70 × (n - 1)
+SHA-256("abc") first word: 0xba7816bf ✓
 ```
+
+### Overall SVM Overhead
+
+| Metric | Value |
+|--------|-------|
+| Mean instruction expansion | 9.31× |
+| Mean CU per rv32im instruction | ~65-100 (control flow) |
+| SHA-256 CU per rv32im instruction | 412 (memory-intensive) |
+
+The overhead varies based on the instruction mix:
+- **Control-flow heavy** (branches, jumps): ~65-80 CU/inst
+- **Memory-intensive** (many loads/stores): ~400+ CU/inst
+
+This is because each RISC-V register access requires loading/storing from SVM memory.
 
 ## Testing
 
@@ -187,8 +197,11 @@ cargo build --release
 # Run benchmarks
 cargo bench
 
-# Run example
+# Run mathematical functions benchmark
 cargo run --example factorial_benchmark
+
+# Run SHA-256 benchmark
+cargo run --example sha256_benchmark
 ```
 
 ## Project Structure
@@ -214,8 +227,13 @@ rv32im-svm/
 │   └── rv32m_tests.rs  # RV32M instruction tests
 ├── benches/
 │   └── factorial.rs    # Factorial benchmark
-└── examples/
-    └── factorial_benchmark.rs
+├── examples/
+│   ├── factorial_benchmark.rs   # Mathematical functions benchmark
+│   └── sha256_benchmark.rs      # SHA-256 real-world benchmark
+└── sha256_benchmark/            # SHA-256 C source files
+    ├── sha256.c                 # SHA-256 implementation
+    ├── start.S                  # Startup assembly
+    └── link.ld                  # Linker script
 ```
 
 ## Limitations
