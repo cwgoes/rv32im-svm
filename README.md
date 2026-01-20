@@ -36,6 +36,71 @@ The compiler uses the following memory layout in the SVM:
 
 RISC-V's 32 registers (x0-x31) are stored in SVM memory at the register file base address. SVM registers (r0-r9) are used as temporaries during instruction execution.
 
+## Compiler Optimizations
+
+The compiler implements several optimizations to reduce SVM instruction count and compute unit usage:
+
+### Write-Through Register Caching
+
+The compiler uses SVM registers R5-R8 as a 4-slot cache for frequently-accessed RISC-V registers:
+- **Stores** always write to both memory and cache register
+- **Loads** check the cache first, avoiding a 5 CU memory load when cache hits
+- Cache hits replace `ldx` (5 CU) with `mov` (1 CU), saving 4 CU per access
+
+### Base Pointer Optimization
+
+Register R9 is pre-loaded with the register file base address (0x8000), enabling indexed addressing:
+```
+# Without optimization: 3 instructions
+mov64 r1, 0x8000
+add64 r1, 40        # offset for x10 (a0)
+ldx   r2, [r1]
+
+# With optimization: 1 instruction
+ldx   r2, [r9+40]   # r9 already has base address
+```
+
+### Sign Extension Elimination
+
+For operations that only use the lower 32 bits (ALU32 operations), the compiler skips sign extension:
+- `load_rv_reg_raw`: Loads without sign extension (saves 2 instructions)
+- Used for addresses, shift amounts, and 32-bit arithmetic
+
+### Zero-Operand Optimizations
+
+Special cases when one operand is the zero register (x0):
+- `ADD rd, rs, zero` → simple move (no addition)
+- `SUB rd, zero, rs` → negation instruction
+- `XOR/OR rd, rs, zero` → simple move
+- `AND rd, rs, zero` → load zero
+- `SLTU rd, rs, zero` → always false (0)
+- `SLTU rd, zero, rs` → test if rs != 0
+
+### Branch with Zero Optimization
+
+When branching with comparison to zero, use immediate comparison instead of loading zero:
+```
+# BEQ rs, zero, target
+# Without optimization: load zero + compare
+mov64 r2, 0
+jeq   r1, r2, target
+
+# With optimization: compare immediate
+jeq   r1, 0, target   # saves 1 instruction
+```
+
+### Combined Shift Operations
+
+Shift-by-immediate operations combine sign extension with the shift:
+```
+# SRAI rd, rs, 5 (arithmetic right shift by 5)
+# Combined into: lsh64 + arsh64 with adjusted shift amounts
+lsh64  r1, 32      # move to upper 32 bits
+arsh64 r1, 37      # 32 + 5 = combined shift
+```
+
+These optimizations reduce the mean compute units per RISC-V instruction from ~70 CU to ~42-46 CU for control-flow heavy code.
+
 ## Usage
 
 ### As a Library
