@@ -142,15 +142,16 @@ impl Compiler {
     }
 
     fn emit_prologue(&mut self) {
-        // Set up SVM r10 (stack pointer) - it's read-only so we use r9 as our stack pointer
-        // Initialize r9 to point to top of stack
-        let stack_top = self.config.stack_base as i32;
-        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R9, stack_top));
+        // Set R9 to the register file base address for indexed access
+        // This saves 1 instruction per load and 1 per store
+        let regfile_base = self.config.regfile_base as i32;
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R9, regfile_base));
 
         // Initialize RISC-V x2 (sp) in register file
-        let sp_addr = self.regfile_addr(Register::SP);
-        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, sp_addr as i32));
-        self.output.push(SvmInstruction::st(MemorySize::Word, SvmRegister::R1, 0, stack_top));
+        let sp_offset = (Register::SP.index() * 4) as i32;
+        let stack_top = self.config.stack_base as i32;
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, stack_top));
+        self.output.push(SvmInstruction::stx(MemorySize::Word, SvmRegister::R9, SvmRegister::R1, sp_offset as i16));
     }
 
     fn emit_epilogue(&mut self) {
@@ -159,35 +160,47 @@ impl Compiler {
         self.output.push(SvmInstruction::exit());
     }
 
-    /// Get memory address for a RISC-V register
-    fn regfile_addr(&self, reg: Register) -> u64 {
-        self.config.regfile_base + (reg.index() as u64 * 4)
-    }
-
-    /// Load a RISC-V register value into an SVM register
+    /// Load a RISC-V register value into an SVM register (with sign extension)
+    /// Uses R9 as base pointer to register file for efficient indexed access
     fn load_rv_reg(&mut self, svm_reg: SvmRegister, rv_reg: Register) {
         if rv_reg == Register::ZERO {
             // x0 is always 0
             self.output.push(SvmInstruction::mov64_imm(svm_reg, 0));
         } else {
-            let addr = self.regfile_addr(rv_reg);
-            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R8, addr as i32));
-            self.output.push(SvmInstruction::ldx(MemorySize::Word, svm_reg, SvmRegister::R8, 0));
+            // Use R9 (register file base) with offset for indexed load
+            let offset = (rv_reg.index() * 4) as i16;
+            self.output.push(SvmInstruction::ldx(MemorySize::Word, svm_reg, SvmRegister::R9, offset));
             // Sign extend from 32-bit to 64-bit
             self.output.push(SvmInstruction::lsh64_imm(svm_reg, 32));
             self.output.push(SvmInstruction::arsh64_imm(svm_reg, 32));
         }
     }
 
+    /// Load a RISC-V register value into an SVM register WITHOUT sign extension
+    /// Use this when the value will be used in alu32 operations (which only use lower 32 bits)
+    /// This saves 2 instructions per load
+    fn load_rv_reg_raw(&mut self, svm_reg: SvmRegister, rv_reg: Register) {
+        if rv_reg == Register::ZERO {
+            // x0 is always 0
+            self.output.push(SvmInstruction::mov64_imm(svm_reg, 0));
+        } else {
+            // Use R9 (register file base) with offset for indexed load
+            let offset = (rv_reg.index() * 4) as i16;
+            self.output.push(SvmInstruction::ldx(MemorySize::Word, svm_reg, SvmRegister::R9, offset));
+            // No sign extension - caller must handle if needed
+        }
+    }
+
     /// Store an SVM register value to a RISC-V register
+    /// Uses R9 as base pointer to register file for efficient indexed access
     fn store_rv_reg(&mut self, rv_reg: Register, svm_reg: SvmRegister) {
         if rv_reg == Register::ZERO {
             // Writes to x0 are ignored
             return;
         }
-        let addr = self.regfile_addr(rv_reg);
-        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R8, addr as i32));
-        self.output.push(SvmInstruction::stx(MemorySize::Word, SvmRegister::R8, svm_reg, 0));
+        // Use R9 (register file base) with offset for indexed store
+        let offset = (rv_reg.index() * 4) as i16;
+        self.output.push(SvmInstruction::stx(MemorySize::Word, SvmRegister::R9, svm_reg, offset));
     }
 
     /// Compile a single RISC-V instruction
@@ -196,7 +209,7 @@ impl Compiler {
 
         match inst {
             // R-type ALU operations
-            Add { rd, rs1, rs2 } => self.compile_r_type_svm(rd, rs1, rs2, opcodes::ADD),
+            Add { rd, rs1, rs2 } => self.compile_add(rd, rs1, rs2),
             Sub { rd, rs1, rs2 } => self.compile_r_type_svm(rd, rs1, rs2, opcodes::SUB),
             Xor { rd, rs1, rs2 } => self.compile_r_type_svm(rd, rs1, rs2, opcodes::XOR),
             Or { rd, rs1, rs2 } => self.compile_r_type_svm(rd, rs1, rs2, opcodes::OR),
@@ -231,12 +244,15 @@ impl Compiler {
             Sw { rs1, rs2, imm } => self.compile_store(rs1, rs2, imm, MemorySize::Word),
 
             // Branch instructions
-            Beq { rs1, rs2, imm } => self.compile_branch(rs1, rs2, imm, opcodes::JEQ),
-            Bne { rs1, rs2, imm } => self.compile_branch(rs1, rs2, imm, opcodes::JNE),
+            // For BEQ/BNE, sign extension doesn't matter (comparing for equality)
+            // For BLT/BGE (signed), need sign-extended values
+            // For BLTU/BGEU (unsigned), need zero-extended (raw) values
+            Beq { rs1, rs2, imm } => self.compile_branch_raw(rs1, rs2, imm, opcodes::JEQ),
+            Bne { rs1, rs2, imm } => self.compile_branch_raw(rs1, rs2, imm, opcodes::JNE),
             Blt { rs1, rs2, imm } => self.compile_branch(rs1, rs2, imm, opcodes::JSLT),
             Bge { rs1, rs2, imm } => self.compile_branch(rs1, rs2, imm, opcodes::JSGE),
-            Bltu { rs1, rs2, imm } => self.compile_branch(rs1, rs2, imm, opcodes::JLT),
-            Bgeu { rs1, rs2, imm } => self.compile_branch(rs1, rs2, imm, opcodes::JGE),
+            Bltu { rs1, rs2, imm } => self.compile_branch_raw(rs1, rs2, imm, opcodes::JLT),
+            Bgeu { rs1, rs2, imm } => self.compile_branch_raw(rs1, rs2, imm, opcodes::JGE),
 
             // Jump instructions
             Jal { rd, imm } => self.compile_jal(rd, imm),
@@ -278,10 +294,37 @@ impl Compiler {
         }
     }
 
+    // Special handling for ADD (handles move pseudo-instruction)
+    fn compile_add(&mut self, rd: Register, rs1: Register, rs2: Register) -> CompilerResult<()> {
+        // ADD rd, rs1, zero is a move: rd = rs1
+        if rs2 == Register::ZERO {
+            if rs1 == Register::ZERO {
+                // ADD rd, zero, zero = load 0
+                self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
+            } else {
+                // Just copy rs1 to rd
+                self.load_rv_reg(SvmRegister::R1, rs1);
+            }
+            self.store_rv_reg(rd, SvmRegister::R1);
+            return Ok(());
+        }
+
+        // ADD rd, zero, rs2 is also a move: rd = rs2
+        if rs1 == Register::ZERO {
+            self.load_rv_reg(SvmRegister::R1, rs2);
+            self.store_rv_reg(rd, SvmRegister::R1);
+            return Ok(());
+        }
+
+        // General case
+        self.compile_r_type_svm(rd, rs1, rs2, opcodes::ADD)
+    }
+
     // R-type using SVM opcodes directly
+    // Uses raw loads since alu32 only uses lower 32 bits
     fn compile_r_type_svm(&mut self, rd: Register, rs1: Register, rs2: Register, op: u8) -> CompilerResult<()> {
-        self.load_rv_reg(SvmRegister::R1, rs1);
-        self.load_rv_reg(SvmRegister::R2, rs2);
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        self.load_rv_reg_raw(SvmRegister::R2, rs2);
         self.output.push(SvmInstruction::alu32_reg(op, SvmRegister::R1, SvmRegister::R2));
         // Sign extend result
         self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
@@ -291,8 +334,9 @@ impl Compiler {
     }
 
     // I-type ALU operations
+    // Uses raw load since alu32 only uses lower 32 bits
     fn compile_i_type(&mut self, rd: Register, rs1: Register, imm: i32, op: u8) -> CompilerResult<()> {
-        self.load_rv_reg(SvmRegister::R1, rs1);
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
         self.output.push(SvmInstruction::alu32_imm(op, SvmRegister::R1, imm));
         // Sign extend result
         self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
@@ -303,7 +347,16 @@ impl Compiler {
 
     // Special handling for ADDI (used for many pseudo-instructions)
     fn compile_i_type_add(&mut self, rd: Register, rs1: Register, imm: i32) -> CompilerResult<()> {
-        self.load_rv_reg(SvmRegister::R1, rs1);
+        // Special case: ADDI rd, zero, imm is just loading a constant
+        // This saves 3 instructions compared to the general case
+        if rs1 == Register::ZERO {
+            // imm is already sign-extended as i32, just use it directly
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, imm));
+            self.store_rv_reg(rd, SvmRegister::R1);
+            return Ok(());
+        }
+
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
         self.output.push(SvmInstruction::add32_imm(SvmRegister::R1, imm));
         // Sign extend result
         self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
@@ -314,8 +367,14 @@ impl Compiler {
 
     // Shift operations with register
     fn compile_shift(&mut self, rd: Register, rs1: Register, rs2: Register, right: bool, arithmetic: bool) -> CompilerResult<()> {
-        self.load_rv_reg(SvmRegister::R1, rs1);
-        self.load_rv_reg(SvmRegister::R2, rs2);
+        // For SRA, we need sign-extended input; for SLL/SRL, raw is fine
+        if arithmetic {
+            self.load_rv_reg(SvmRegister::R1, rs1);
+        } else {
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        }
+        // Shift amount doesn't need sign extension - masked to 5 bits anyway
+        self.load_rv_reg_raw(SvmRegister::R2, rs2);
         // Mask shift amount to 5 bits
         self.output.push(SvmInstruction::and32_imm(SvmRegister::R2, 0x1f));
 
@@ -344,7 +403,9 @@ impl Compiler {
 
     // Shift operations with immediate
     fn compile_shift_imm(&mut self, rd: Register, rs1: Register, shamt: u32, right: bool, arithmetic: bool) -> CompilerResult<()> {
-        self.load_rv_reg(SvmRegister::R1, rs1);
+        // For SRA, we need sign-extended input; for SLL/SRL, raw is fine
+        // SRL explicitly zero-extends below, SLL result is truncated
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
         let shamt = (shamt & 0x1f) as i32;
 
         if right {
@@ -372,8 +433,15 @@ impl Compiler {
 
     // Set less than (register)
     fn compile_slt(&mut self, rd: Register, rs1: Register, rs2: Register, signed: bool) -> CompilerResult<()> {
-        self.load_rv_reg(SvmRegister::R1, rs1);
-        self.load_rv_reg(SvmRegister::R2, rs2);
+        // For signed comparison, we need sign-extended values
+        // For unsigned comparison, zero-extended (raw) is correct
+        if signed {
+            self.load_rv_reg(SvmRegister::R1, rs1);
+            self.load_rv_reg(SvmRegister::R2, rs2);
+        } else {
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+            self.load_rv_reg_raw(SvmRegister::R2, rs2);
+        }
 
         // Use conditional jump to set result
         // r3 = 1 (assume less than)
@@ -396,7 +464,13 @@ impl Compiler {
 
     // Set less than immediate
     fn compile_slti(&mut self, rd: Register, rs1: Register, imm: i32, signed: bool) -> CompilerResult<()> {
-        self.load_rv_reg(SvmRegister::R1, rs1);
+        // For signed comparison, we need sign-extended value
+        // For unsigned comparison, zero-extended (raw) is correct
+        if signed {
+            self.load_rv_reg(SvmRegister::R1, rs1);
+        } else {
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        }
 
         // r3 = 1 (assume less than)
         self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, 1));
@@ -417,9 +491,13 @@ impl Compiler {
     // Load instructions
     fn compile_load(&mut self, rd: Register, rs1: Register, imm: i32, size: MemorySize, sign_extend: bool) -> CompilerResult<()> {
         // Calculate address: base + imm + memory_base
-        self.load_rv_reg(SvmRegister::R1, rs1);
-        self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, imm));
-        self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, self.config.memory_base as i32));
+        // Use raw load for address - no sign extension needed for address calculation
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        // Combine imm and memory_base into single add if possible
+        let total_offset = imm.wrapping_add(self.config.memory_base as i32);
+        if total_offset != 0 {
+            self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, total_offset));
+        }
 
         // Load value
         self.output.push(SvmInstruction::ldx(size, SvmRegister::R2, SvmRegister::R1, 0));
@@ -449,13 +527,16 @@ impl Compiler {
 
     // Store instructions
     fn compile_store(&mut self, rs1: Register, rs2: Register, imm: i32, size: MemorySize) -> CompilerResult<()> {
-        // Calculate address
-        self.load_rv_reg(SvmRegister::R1, rs1);
-        self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, imm));
-        self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, self.config.memory_base as i32));
+        // Calculate address - use raw load (no sign extension needed for addresses)
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        // Combine imm and memory_base into single add if possible
+        let total_offset = imm.wrapping_add(self.config.memory_base as i32);
+        if total_offset != 0 {
+            self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, total_offset));
+        }
 
-        // Load value to store
-        self.load_rv_reg(SvmRegister::R2, rs2);
+        // Load value to store - raw load is fine, we store lower bits
+        self.load_rv_reg_raw(SvmRegister::R2, rs2);
 
         // Store
         self.output.push(SvmInstruction::stx(size, SvmRegister::R1, SvmRegister::R2, 0));
@@ -463,12 +544,31 @@ impl Compiler {
     }
 
     // Branch instructions
+    // Branch with sign-extended loads (for signed comparisons BLT, BGE)
     fn compile_branch(&mut self, rs1: Register, rs2: Register, imm: i32, jmp_op: u8) -> CompilerResult<()> {
         self.load_rv_reg(SvmRegister::R1, rs1);
         self.load_rv_reg(SvmRegister::R2, rs2);
 
         // Calculate target instruction index
         // imm is byte offset, divide by 4 to get instruction offset
+        let inst_offset = imm / 4;
+        let target_idx = (self.rv_pc as i32 + inst_offset) as usize;
+
+        // Emit jump with placeholder offset (will be fixed up later)
+        let jmp_idx = self.output.len();
+        self.output.push(SvmInstruction::jmp_reg(jmp_op, SvmRegister::R1, SvmRegister::R2, 0));
+
+        // Record fixup
+        self.branch_fixups.push((jmp_idx, target_idx));
+        Ok(())
+    }
+
+    // Branch with raw loads (for equality BEQ/BNE and unsigned BLTU/BGEU)
+    fn compile_branch_raw(&mut self, rs1: Register, rs2: Register, imm: i32, jmp_op: u8) -> CompilerResult<()> {
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        self.load_rv_reg_raw(SvmRegister::R2, rs2);
+
+        // Calculate target instruction index
         let inst_offset = imm / 4;
         let target_idx = (self.rv_pc as i32 + inst_offset) as usize;
 
