@@ -1,0 +1,1335 @@
+//! rv32im to SVM translator
+//!
+//! This module translates RISC-V rv32im instructions to SVM bytecode.
+//!
+//! Memory layout:
+//! - 0x0000 - 0x7FFF: Program data/heap
+//! - 0x8000 - 0x807F: RISC-V register file (32 * 4 bytes = 128 bytes)
+//! - 0x8080+: Stack (grows downward)
+//!
+//! The compiler uses a memory-based register file approach where all RISC-V
+//! registers are stored in memory. SVM registers are used as temporaries.
+
+use crate::riscv::{Instruction, Register};
+use crate::svm::{opcodes, MemorySize, SvmInstruction, SvmProgram, SvmRegister};
+use std::collections::HashMap;
+use thiserror::Error;
+
+/// Compiler error
+#[derive(Debug, Error)]
+pub enum CompilerError {
+    #[error("Unsupported instruction: {0}")]
+    UnsupportedInstruction(String),
+
+    #[error("Invalid branch target: {0}")]
+    InvalidBranchTarget(i32),
+
+    #[error("Program too large: {0} instructions")]
+    ProgramTooLarge(usize),
+}
+
+/// Compiler result type
+pub type CompilerResult<T> = Result<T, CompilerError>;
+
+/// Compiler configuration
+#[derive(Debug, Clone)]
+pub struct CompilerConfig {
+    /// Base address for RISC-V register file in SVM memory
+    pub regfile_base: u64,
+
+    /// Base address for RISC-V memory in SVM memory
+    pub memory_base: u64,
+
+    /// Stack base address
+    pub stack_base: u64,
+
+    /// Initial PC value (byte address in RISC-V)
+    pub initial_pc: u32,
+}
+
+impl Default for CompilerConfig {
+    fn default() -> Self {
+        CompilerConfig {
+            regfile_base: 0x8000,
+            memory_base: 0x0000,
+            stack_base: 0x10000, // 64KB
+            initial_pc: 0,
+        }
+    }
+}
+
+/// rv32im to SVM compiler
+pub struct Compiler {
+    config: CompilerConfig,
+    /// Output SVM program
+    output: SvmProgram,
+    /// Mapping from RISC-V instruction index to SVM instruction index
+    pc_map: HashMap<usize, usize>,
+    /// RISC-V instructions being compiled
+    rv_instructions: Vec<Instruction>,
+    /// Current RISC-V instruction index
+    rv_pc: usize,
+    /// Pending branch fixups: (svm_index, rv_target_index)
+    branch_fixups: Vec<(usize, usize)>,
+    /// Return sites: RV byte addresses that can be return targets (after JAL)
+    return_sites: Vec<usize>,
+    /// JALR dispatch fixups: (svm_index) - jump instructions that need dispatch table target
+    jalr_fixups: Vec<usize>,
+    /// Register cache: maps SVM register (R5-R8) index to cached RV register
+    /// None means the slot is empty
+    reg_cache: [Option<Register>; 4],
+    /// Dirty flags for cached registers (need writeback)
+    reg_cache_dirty: [bool; 4],
+}
+
+impl Compiler {
+    /// Create a new compiler with default configuration
+    pub fn new() -> Self {
+        Self::with_config(CompilerConfig::default())
+    }
+
+    /// Create a new compiler with given configuration
+    pub fn with_config(config: CompilerConfig) -> Self {
+        Compiler {
+            config,
+            output: SvmProgram::new(),
+            pc_map: HashMap::new(),
+            rv_instructions: Vec::new(),
+            rv_pc: 0,
+            branch_fixups: Vec::new(),
+            return_sites: Vec::new(),
+            jalr_fixups: Vec::new(),
+            reg_cache: [None; 4],
+            reg_cache_dirty: [false; 4],
+        }
+    }
+
+    /// Compile a sequence of RISC-V instructions
+    pub fn compile(&mut self, instructions: &[Instruction]) -> CompilerResult<SvmProgram> {
+        self.rv_instructions = instructions.to_vec();
+        self.output = SvmProgram::new();
+        self.pc_map.clear();
+        self.branch_fixups.clear();
+        self.return_sites.clear();
+        self.jalr_fixups.clear();
+        self.reg_cache = [None; 4];
+        self.reg_cache_dirty = [false; 4];
+
+        // First pass: emit prologue
+        self.emit_prologue();
+
+        // Second pass: compile each instruction
+        for (idx, inst) in instructions.iter().enumerate() {
+            self.rv_pc = idx;
+            // Record PC mapping before emitting
+            self.pc_map.insert(idx, self.output.len());
+            self.compile_instruction(*inst)?;
+        }
+
+        // Record the "end" position for branches that jump past the last instruction
+        self.pc_map.insert(instructions.len(), self.output.len());
+
+        // Third pass: fix up branches
+        self.fixup_branches()?;
+
+        // Fourth pass: emit return dispatch table if needed
+        self.emit_return_dispatch()?;
+
+        // Emit epilogue (return)
+        self.emit_epilogue();
+
+        Ok(std::mem::take(&mut self.output))
+    }
+
+    /// Compile RISC-V binary (array of 32-bit words)
+    pub fn compile_binary(&mut self, binary: &[u32]) -> CompilerResult<SvmProgram> {
+        let instructions: Vec<Instruction> = binary
+            .iter()
+            .map(|&word| crate::riscv::decode(word))
+            .collect();
+        self.compile(&instructions)
+    }
+
+    fn emit_prologue(&mut self) {
+        // Set R9 to the register file base address for indexed access
+        // This saves 1 instruction per load and 1 per store
+        let regfile_base = self.config.regfile_base as i32;
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R9, regfile_base));
+
+        // Initialize RISC-V x2 (sp) in register file
+        let sp_offset = (Register::SP.index() * 4) as i32;
+        let stack_top = self.config.stack_base as i32;
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, stack_top));
+        self.output.push(SvmInstruction::stx(MemorySize::Word, SvmRegister::R9, SvmRegister::R1, sp_offset as i16));
+    }
+
+    fn emit_epilogue(&mut self) {
+        // Flush any cached registers before exit
+        self.flush_cache();
+        // Load return value from a0 (x10) to r0
+        self.load_rv_reg(SvmRegister::R0, Register::A0);
+        self.output.push(SvmInstruction::exit());
+    }
+
+    /// Load a RISC-V register value into an SVM register (with sign extension)
+    /// Uses R9 as base pointer to register file for efficient indexed access
+    /// Cache-aware: checks cache first before loading from memory
+    fn load_rv_reg(&mut self, svm_reg: SvmRegister, rv_reg: Register) {
+        if rv_reg == Register::ZERO {
+            // x0 is always 0
+            self.output.push(SvmInstruction::mov64_imm(svm_reg, 0));
+        } else if let Some(slot) = self.find_in_cache(rv_reg) {
+            // Value is in cache - copy from cache register
+            let cache_reg = self.cache_slot_to_svm(slot);
+            if cache_reg != svm_reg {
+                self.output.push(SvmInstruction::mov64_reg(svm_reg, cache_reg));
+            }
+            // Sign extend from 32-bit to 64-bit
+            self.output.push(SvmInstruction::lsh64_imm(svm_reg, 32));
+            self.output.push(SvmInstruction::arsh64_imm(svm_reg, 32));
+        } else {
+            // Use R9 (register file base) with offset for indexed load
+            let offset = (rv_reg.index() * 4) as i16;
+            self.output.push(SvmInstruction::ldx(MemorySize::Word, svm_reg, SvmRegister::R9, offset));
+            // Sign extend from 32-bit to 64-bit
+            self.output.push(SvmInstruction::lsh64_imm(svm_reg, 32));
+            self.output.push(SvmInstruction::arsh64_imm(svm_reg, 32));
+        }
+    }
+
+    /// Load a RISC-V register value into an SVM register WITHOUT sign extension
+    /// Use this when the value will be used in alu32 operations (which only use lower 32 bits)
+    /// This saves 2 instructions per load
+    /// Cache-aware: checks cache first before loading from memory
+    fn load_rv_reg_raw(&mut self, svm_reg: SvmRegister, rv_reg: Register) {
+        if rv_reg == Register::ZERO {
+            // x0 is always 0
+            self.output.push(SvmInstruction::mov64_imm(svm_reg, 0));
+        } else if let Some(slot) = self.find_in_cache(rv_reg) {
+            // Value is in cache - copy from cache register
+            let cache_reg = self.cache_slot_to_svm(slot);
+            if cache_reg != svm_reg {
+                self.output.push(SvmInstruction::mov64_reg(svm_reg, cache_reg));
+            }
+            // No sign extension - caller must handle if needed
+        } else {
+            // Use R9 (register file base) with offset for indexed load
+            let offset = (rv_reg.index() * 4) as i16;
+            self.output.push(SvmInstruction::ldx(MemorySize::Word, svm_reg, SvmRegister::R9, offset));
+            // No sign extension - caller must handle if needed
+        }
+    }
+
+    /// Store an SVM register value to a RISC-V register
+    /// Uses R9 as base pointer to register file for efficient indexed access
+    /// With write-through caching: also updates cache register if present
+    fn store_rv_reg(&mut self, rv_reg: Register, svm_reg: SvmRegister) {
+        if rv_reg == Register::ZERO {
+            // Writes to x0 are ignored
+            return;
+        }
+        // Use R9 (register file base) with offset for indexed store
+        let offset = (rv_reg.index() * 4) as i16;
+        self.output.push(SvmInstruction::stx(MemorySize::Word, SvmRegister::R9, svm_reg, offset));
+
+        // If this register is in cache, update the cache register too
+        if let Some(slot) = self.find_in_cache(rv_reg) {
+            let cache_reg = self.cache_slot_to_svm(slot);
+            if cache_reg != svm_reg {
+                self.output.push(SvmInstruction::mov64_reg(cache_reg, svm_reg));
+            }
+            // Cache is already tracking this register, and it's not dirty (just wrote to memory)
+        }
+    }
+
+    // ========== Register Cache Management ==========
+    // Cache uses SVM R5-R8 to hold frequently-used RV registers
+
+    /// Get SVM register for a cache slot (0-3 -> R5-R8)
+    fn cache_slot_to_svm(&self, slot: usize) -> SvmRegister {
+        match slot {
+            0 => SvmRegister::R5,
+            1 => SvmRegister::R6,
+            2 => SvmRegister::R7,
+            3 => SvmRegister::R8,
+            _ => panic!("Invalid cache slot"),
+        }
+    }
+
+    /// Find if an RV register is in the cache, returns cache slot index
+    fn find_in_cache(&self, rv_reg: Register) -> Option<usize> {
+        for i in 0..4 {
+            if self.reg_cache[i] == Some(rv_reg) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Invalidate a cached register (when it's written via a different path)
+    #[allow(dead_code)]
+    fn invalidate_cached_reg(&mut self, rv_reg: Register) {
+        if let Some(slot) = self.find_in_cache(rv_reg) {
+            self.reg_cache[slot] = None;
+            self.reg_cache_dirty[slot] = false;
+        }
+    }
+
+    /// Flush all dirty cached registers to memory
+    #[allow(dead_code)]
+    fn flush_cache(&mut self) {
+        for i in 0..4 {
+            if let Some(rv_reg) = self.reg_cache[i] {
+                if self.reg_cache_dirty[i] {
+                    let svm_reg = self.cache_slot_to_svm(i);
+                    let offset = (rv_reg.index() * 4) as i16;
+                    self.output.push(SvmInstruction::stx(MemorySize::Word, SvmRegister::R9, svm_reg, offset));
+                    self.reg_cache_dirty[i] = false;
+                }
+            }
+        }
+    }
+
+    /// Clear the entire cache (with write-through, no flush needed)
+    #[allow(dead_code)]
+    fn clear_cache(&mut self) {
+        // With write-through caching, memory is always up-to-date
+        // so we just need to clear the tracking
+        self.reg_cache = [None; 4];
+        self.reg_cache_dirty = [false; 4];
+    }
+
+    /// Load RV register into cache slot, returns the SVM register
+    /// If already cached, returns the cached SVM register
+    /// Evicts LRU slot if cache is full
+    #[allow(dead_code)]
+    fn load_cached(&mut self, rv_reg: Register) -> SvmRegister {
+        if rv_reg == Register::ZERO {
+            // x0 is always 0, use R1 as temp
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
+            return SvmRegister::R1;
+        }
+
+        // Check if already cached
+        if let Some(slot) = self.find_in_cache(rv_reg) {
+            return self.cache_slot_to_svm(slot);
+        }
+
+        // Find an empty slot or evict
+        let slot = self.find_or_evict_slot();
+        let svm_reg = self.cache_slot_to_svm(slot);
+
+        // Load the value
+        let offset = (rv_reg.index() * 4) as i16;
+        self.output.push(SvmInstruction::ldx(MemorySize::Word, svm_reg, SvmRegister::R9, offset));
+
+        // Update cache state
+        self.reg_cache[slot] = Some(rv_reg);
+        self.reg_cache_dirty[slot] = false;
+
+        svm_reg
+    }
+
+    /// Store to a cached register (marks as dirty)
+    #[allow(dead_code)]
+    fn store_cached(&mut self, rv_reg: Register, value_reg: SvmRegister) {
+        if rv_reg == Register::ZERO {
+            return; // Writes to x0 are ignored
+        }
+
+        // Check if already cached
+        let slot = if let Some(slot) = self.find_in_cache(rv_reg) {
+            slot
+        } else {
+            // Allocate a new slot
+            self.find_or_evict_slot()
+        };
+
+        let svm_reg = self.cache_slot_to_svm(slot);
+
+        // Copy value to cache register if different
+        if value_reg != svm_reg {
+            self.output.push(SvmInstruction::mov64_reg(svm_reg, value_reg));
+        }
+
+        // Update cache state
+        self.reg_cache[slot] = Some(rv_reg);
+        self.reg_cache_dirty[slot] = true;
+    }
+
+    /// Find an empty cache slot or evict one
+    fn find_or_evict_slot(&mut self) -> usize {
+        // First, look for empty slot
+        for i in 0..4 {
+            if self.reg_cache[i].is_none() {
+                return i;
+            }
+        }
+
+        // No empty slot - evict slot 0 (FIFO eviction)
+        // Write back if dirty
+        if self.reg_cache_dirty[0] {
+            if let Some(rv_reg) = self.reg_cache[0] {
+                let offset = (rv_reg.index() * 4) as i16;
+                self.output.push(SvmInstruction::stx(MemorySize::Word, SvmRegister::R9, SvmRegister::R5, offset));
+            }
+        }
+
+        // Clear slot 0 and return it
+        self.reg_cache[0] = None;
+        self.reg_cache_dirty[0] = false;
+        0
+    }
+
+    /// Load RV register value into specified SVM temp register, using cache if available
+    /// This is the cached version of load_rv_reg_raw
+    fn load_rv_reg_cached(&mut self, svm_reg: SvmRegister, rv_reg: Register) {
+        if rv_reg == Register::ZERO {
+            self.output.push(SvmInstruction::mov64_imm(svm_reg, 0));
+            return;
+        }
+
+        // Check if value is in cache
+        if let Some(slot) = self.find_in_cache(rv_reg) {
+            // Copy from cache register to temp register
+            let cache_reg = self.cache_slot_to_svm(slot);
+            if cache_reg != svm_reg {
+                self.output.push(SvmInstruction::mov64_reg(svm_reg, cache_reg));
+            }
+            // If cache_reg == svm_reg, value is already there
+        } else {
+            // Load from memory
+            let offset = (rv_reg.index() * 4) as i16;
+            self.output.push(SvmInstruction::ldx(MemorySize::Word, svm_reg, SvmRegister::R9, offset));
+        }
+    }
+
+    /// Store SVM temp register value to RV register, using write-through cache
+    /// Always writes to memory AND updates cache. This ensures memory is always up-to-date.
+    fn store_rv_reg_cached(&mut self, rv_reg: Register, svm_reg: SvmRegister) {
+        if rv_reg == Register::ZERO {
+            return;
+        }
+
+        // Always write to memory first (write-through)
+        let offset = (rv_reg.index() * 4) as i16;
+        self.output.push(SvmInstruction::stx(MemorySize::Word, SvmRegister::R9, svm_reg, offset));
+
+        // Check if already in cache
+        let slot = if let Some(slot) = self.find_in_cache(rv_reg) {
+            slot
+        } else {
+            // Allocate a cache slot
+            self.find_or_evict_slot()
+        };
+
+        let cache_reg = self.cache_slot_to_svm(slot);
+
+        // Copy value to cache register
+        if svm_reg != cache_reg {
+            self.output.push(SvmInstruction::mov64_reg(cache_reg, svm_reg));
+        }
+
+        // Update cache state (not dirty since already written to memory)
+        self.reg_cache[slot] = Some(rv_reg);
+        self.reg_cache_dirty[slot] = false;
+    }
+
+    /// Compile a single RISC-V instruction
+    fn compile_instruction(&mut self, inst: Instruction) -> CompilerResult<()> {
+        use Instruction::*;
+
+        match inst {
+            // R-type ALU operations - optimize common zero-operand patterns
+            Add { rd, rs1, rs2 } => self.compile_add(rd, rs1, rs2),
+            // SUB rd, zero, rs2 = negation
+            Sub { rd, rs1, rs2 } if rs1 == Register::ZERO => self.compile_neg(rd, rs2),
+            Sub { rd, rs1, rs2 } => self.compile_r_type_svm(rd, rs1, rs2, opcodes::SUB),
+            // XOR/OR with zero = move
+            Xor { rd, rs1, rs2 } if rs2 == Register::ZERO => self.compile_move(rd, rs1),
+            Xor { rd, rs1, rs2 } if rs1 == Register::ZERO => self.compile_move(rd, rs2),
+            Or { rd, rs1, rs2 } if rs2 == Register::ZERO => self.compile_move(rd, rs1),
+            Or { rd, rs1, rs2 } if rs1 == Register::ZERO => self.compile_move(rd, rs2),
+            // AND with zero = 0
+            And { rd, rs1: _, rs2 } if rs2 == Register::ZERO => self.compile_load_zero(rd),
+            And { rd, rs1, rs2: _ } if rs1 == Register::ZERO => self.compile_load_zero(rd),
+            Xor { rd, rs1, rs2 } => self.compile_r_type_svm(rd, rs1, rs2, opcodes::XOR),
+            Or { rd, rs1, rs2 } => self.compile_r_type_svm(rd, rs1, rs2, opcodes::OR),
+            And { rd, rs1, rs2 } => self.compile_r_type_svm(rd, rs1, rs2, opcodes::AND),
+            Sll { rd, rs1, rs2 } => self.compile_shift(rd, rs1, rs2, false, false),
+            Srl { rd, rs1, rs2 } => self.compile_shift(rd, rs1, rs2, true, false),
+            Sra { rd, rs1, rs2 } => self.compile_shift(rd, rs1, rs2, true, true),
+            Slt { rd, rs1, rs2 } => self.compile_slt(rd, rs1, rs2, true),
+            // SLTU rd, rs1, zero: rs1 < 0 (unsigned) = always false
+            Sltu { rd, rs1: _, rs2 } if rs2 == Register::ZERO => self.compile_load_zero(rd),
+            // SLTU rd, zero, rs2: 0 < rs2 (unsigned) = rs2 != 0
+            Sltu { rd, rs1, rs2 } if rs1 == Register::ZERO => self.compile_sltu_zero(rd, rs2),
+            Sltu { rd, rs1, rs2 } => self.compile_slt(rd, rs1, rs2, false),
+
+            // I-type ALU operations
+            Addi { rd, rs1, imm } => self.compile_i_type_add(rd, rs1, imm),
+            Xori { rd, rs1, imm } => self.compile_i_type(rd, rs1, imm, opcodes::XOR),
+            Ori { rd, rs1, imm } => self.compile_i_type(rd, rs1, imm, opcodes::OR),
+            Andi { rd, rs1, imm } => self.compile_i_type(rd, rs1, imm, opcodes::AND),
+            Slli { rd, rs1, shamt } => self.compile_shift_imm(rd, rs1, shamt, false, false),
+            Srli { rd, rs1, shamt } => self.compile_shift_imm(rd, rs1, shamt, true, false),
+            Srai { rd, rs1, shamt } => self.compile_shift_imm(rd, rs1, shamt, true, true),
+            Slti { rd, rs1, imm } => self.compile_slti(rd, rs1, imm, true),
+            Sltiu { rd, rs1, imm } => self.compile_slti(rd, rs1, imm, false),
+
+            // Load instructions
+            Lb { rd, rs1, imm } => self.compile_load(rd, rs1, imm, MemorySize::Byte, true),
+            Lh { rd, rs1, imm } => self.compile_load(rd, rs1, imm, MemorySize::Half, true),
+            Lw { rd, rs1, imm } => self.compile_load(rd, rs1, imm, MemorySize::Word, true),
+            Lbu { rd, rs1, imm } => self.compile_load(rd, rs1, imm, MemorySize::Byte, false),
+            Lhu { rd, rs1, imm } => self.compile_load(rd, rs1, imm, MemorySize::Half, false),
+
+            // Store instructions
+            Sb { rs1, rs2, imm } => self.compile_store(rs1, rs2, imm, MemorySize::Byte),
+            Sh { rs1, rs2, imm } => self.compile_store(rs1, rs2, imm, MemorySize::Half),
+            Sw { rs1, rs2, imm } => self.compile_store(rs1, rs2, imm, MemorySize::Word),
+
+            // Branch instructions
+            // Optimize comparisons with zero using immediate comparison
+            Beq { rs1, rs2, imm } if rs2 == Register::ZERO => self.compile_branch_zero(rs1, imm, opcodes::JEQ),
+            Bne { rs1, rs2, imm } if rs2 == Register::ZERO => self.compile_branch_zero(rs1, imm, opcodes::JNE),
+            Beq { rs1, rs2, imm } if rs1 == Register::ZERO => self.compile_branch_zero(rs2, imm, opcodes::JEQ),
+            Bne { rs1, rs2, imm } if rs1 == Register::ZERO => self.compile_branch_zero(rs2, imm, opcodes::JNE),
+            // For BLT/BGE with zero, we can also optimize (checking against 0)
+            Blt { rs1, rs2, imm } if rs2 == Register::ZERO => self.compile_branch_zero(rs1, imm, opcodes::JSLT),
+            Bge { rs1, rs2, imm } if rs2 == Register::ZERO => self.compile_branch_zero(rs1, imm, opcodes::JSGE),
+            Bltu { rs1, rs2, imm } if rs2 == Register::ZERO => self.compile_branch_zero_raw(rs1, imm, opcodes::JLT),
+            Bgeu { rs1, rs2, imm } if rs2 == Register::ZERO => self.compile_branch_zero_raw(rs1, imm, opcodes::JGE),
+            // General cases
+            Beq { rs1, rs2, imm } => self.compile_branch_raw(rs1, rs2, imm, opcodes::JEQ),
+            Bne { rs1, rs2, imm } => self.compile_branch_raw(rs1, rs2, imm, opcodes::JNE),
+            Blt { rs1, rs2, imm } => self.compile_branch(rs1, rs2, imm, opcodes::JSLT),
+            Bge { rs1, rs2, imm } => self.compile_branch(rs1, rs2, imm, opcodes::JSGE),
+            Bltu { rs1, rs2, imm } => self.compile_branch_raw(rs1, rs2, imm, opcodes::JLT),
+            Bgeu { rs1, rs2, imm } => self.compile_branch_raw(rs1, rs2, imm, opcodes::JGE),
+
+            // Jump instructions
+            Jal { rd, imm } => self.compile_jal(rd, imm),
+            Jalr { rd, rs1, imm } => self.compile_jalr(rd, rs1, imm),
+
+            // U-type instructions
+            Lui { rd, imm } => self.compile_lui(rd, imm),
+            Auipc { rd, imm } => self.compile_auipc(rd, imm),
+
+            // System instructions
+            Ecall => self.compile_ecall(),
+            Ebreak => self.compile_ebreak(),
+            Fence { .. } | FenceI => {
+                // Fence instructions are no-ops in our single-threaded model
+                Ok(())
+            }
+
+            // CSR instructions - simplified handling
+            Csrrw { rd, rs1, csr } => self.compile_csr(rd, rs1, csr),
+            Csrrs { rd, rs1, csr } => self.compile_csr(rd, rs1, csr),
+            Csrrc { rd, rs1, csr } => self.compile_csr(rd, rs1, csr),
+            Csrrwi { rd, uimm: _, csr } => self.compile_csr_imm(rd, csr),
+            Csrrsi { rd, uimm: _, csr } => self.compile_csr_imm(rd, csr),
+            Csrrci { rd, uimm: _, csr } => self.compile_csr_imm(rd, csr),
+
+            // M extension
+            Mul { rd, rs1, rs2 } => self.compile_mul(rd, rs1, rs2),
+            Mulh { rd, rs1, rs2 } => self.compile_mulh(rd, rs1, rs2, true, true),
+            Mulhsu { rd, rs1, rs2 } => self.compile_mulh(rd, rs1, rs2, true, false),
+            Mulhu { rd, rs1, rs2 } => self.compile_mulh(rd, rs1, rs2, false, false),
+            Div { rd, rs1, rs2 } => self.compile_div(rd, rs1, rs2, true),
+            Divu { rd, rs1, rs2 } => self.compile_div(rd, rs1, rs2, false),
+            Rem { rd, rs1, rs2 } => self.compile_rem(rd, rs1, rs2, true),
+            Remu { rd, rs1, rs2 } => self.compile_rem(rd, rs1, rs2, false),
+
+            Unknown(word) => {
+                Err(CompilerError::UnsupportedInstruction(format!("{:#010x}", word)))
+            }
+        }
+    }
+
+    // Optimized move: rd = rs
+    fn compile_move(&mut self, rd: Register, rs: Register) -> CompilerResult<()> {
+        if rs == Register::ZERO {
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
+        } else {
+            self.load_rv_reg_raw(SvmRegister::R1, rs);
+        }
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // Load zero into register
+    fn compile_load_zero(&mut self, rd: Register) -> CompilerResult<()> {
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // SLTU rd, zero, rs2: 0 < rs2 (unsigned) = rs2 != 0
+    fn compile_sltu_zero(&mut self, rd: Register, rs: Register) -> CompilerResult<()> {
+        self.load_rv_reg_raw(SvmRegister::R1, rs);
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, 1));
+        // If R1 != 0, skip next instruction (result is 1)
+        self.output.push(SvmInstruction::jmp_imm(opcodes::JNE, SvmRegister::R1, 0, 1));
+        // R1 == 0, result is 0
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, 0));
+        self.store_rv_reg(rd, SvmRegister::R3);
+        Ok(())
+    }
+
+    // Negation: rd = -rs (SUB rd, zero, rs)
+    // No sign extension needed - neg32 produces correct lower 32 bits
+    fn compile_neg(&mut self, rd: Register, rs: Register) -> CompilerResult<()> {
+        self.load_rv_reg_raw(SvmRegister::R1, rs);
+        self.output.push(SvmInstruction::neg32(SvmRegister::R1));
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // Special handling for ADD (handles move pseudo-instruction)
+    fn compile_add(&mut self, rd: Register, rs1: Register, rs2: Register) -> CompilerResult<()> {
+        // ADD rd, rs1, zero is a move: rd = rs1
+        if rs2 == Register::ZERO {
+            if rs1 == Register::ZERO {
+                // ADD rd, zero, zero = load 0
+                self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
+            } else {
+                // Just copy rs1 to rd - raw load is fine (preserves 32-bit value)
+                self.load_rv_reg_raw(SvmRegister::R1, rs1);
+            }
+            self.store_rv_reg(rd, SvmRegister::R1);
+            return Ok(());
+        }
+
+        // ADD rd, zero, rs2 is also a move: rd = rs2
+        if rs1 == Register::ZERO {
+            self.load_rv_reg_raw(SvmRegister::R1, rs2);
+            self.store_rv_reg(rd, SvmRegister::R1);
+            return Ok(());
+        }
+
+        // General case
+        self.compile_r_type_svm(rd, rs1, rs2, opcodes::ADD)
+    }
+
+    // R-type using SVM opcodes directly
+    // Uses cached loads/stores for better performance in loops
+    // No sign extension needed - lower 32 bits are correct and that's what we store
+    fn compile_r_type_svm(&mut self, rd: Register, rs1: Register, rs2: Register, op: u8) -> CompilerResult<()> {
+        self.load_rv_reg_cached(SvmRegister::R1, rs1);
+        self.load_rv_reg_cached(SvmRegister::R2, rs2);
+        self.output.push(SvmInstruction::alu32_reg(op, SvmRegister::R1, SvmRegister::R2));
+        self.store_rv_reg_cached(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // I-type ALU operations
+    // Uses cached loads/stores for better performance in loops
+    // No sign extension needed - lower 32 bits are correct and that's what we store
+    fn compile_i_type(&mut self, rd: Register, rs1: Register, imm: i32, op: u8) -> CompilerResult<()> {
+        self.load_rv_reg_cached(SvmRegister::R1, rs1);
+        self.output.push(SvmInstruction::alu32_imm(op, SvmRegister::R1, imm));
+        self.store_rv_reg_cached(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // Special handling for ADDI (used for many pseudo-instructions)
+    fn compile_i_type_add(&mut self, rd: Register, rs1: Register, imm: i32) -> CompilerResult<()> {
+        // Special case: ADDI rd, zero, imm is just loading a constant
+        // This saves instructions compared to the general case
+        if rs1 == Register::ZERO {
+            // imm is already sign-extended as i32, just use it directly
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, imm));
+            self.store_rv_reg_cached(rd, SvmRegister::R1);
+            return Ok(());
+        }
+
+        self.load_rv_reg_cached(SvmRegister::R1, rs1);
+        self.output.push(SvmInstruction::add32_imm(SvmRegister::R1, imm));
+        // No sign extension needed - lower 32 bits are correct and that's what we store
+        self.store_rv_reg_cached(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // Shift operations with register
+    fn compile_shift(&mut self, rd: Register, rs1: Register, rs2: Register, right: bool, arithmetic: bool) -> CompilerResult<()> {
+        // Shift amount doesn't need sign extension - masked to 5 bits anyway
+        self.load_rv_reg_raw(SvmRegister::R2, rs2);
+        // Mask shift amount to 5 bits
+        self.output.push(SvmInstruction::and32_imm(SvmRegister::R2, 0x1f));
+
+        if right {
+            if arithmetic {
+                // SRA: load_rv_reg provides sign-extended value, shift directly
+                // Result is sign-extended (arithmetic shift preserves sign)
+                self.load_rv_reg(SvmRegister::R1, rs1);
+                self.output.push(SvmInstruction::arsh64_reg(SvmRegister::R1, SvmRegister::R2));
+            } else {
+                // SRL: load raw, zero extend, then logical shift
+                // Result is zero-extended in lower 32 bits
+                self.load_rv_reg_raw(SvmRegister::R1, rs1);
+                self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
+                self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, 32));
+                self.output.push(SvmInstruction::rsh64_reg(SvmRegister::R1, SvmRegister::R2));
+            }
+        } else {
+            // SLL: raw load, shift left
+            // Lower 32 bits contain correct result
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+            self.output.push(SvmInstruction::lsh64_reg(SvmRegister::R1, SvmRegister::R2));
+        }
+
+        // Store lower 32 bits directly - no truncation needed
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // Shift operations with immediate - optimized by combining consecutive shifts
+    fn compile_shift_imm(&mut self, rd: Register, rs1: Register, shamt: u32, right: bool, arithmetic: bool) -> CompilerResult<()> {
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        let shamt = (shamt & 0x1f) as i32;
+
+        if right {
+            if arithmetic {
+                // SRAI: Sign extend, then arithmetic shift - combine the two arithmetic shifts
+                // After arsh64, result is already sign-extended in lower 32 bits
+                self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
+                self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32 + shamt));
+            } else {
+                // SRLI: Zero extend, then logical shift - combine the two logical shifts
+                // After rsh64, result is zero-extended in lower 32 bits
+                self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
+                self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, 32 + shamt));
+            }
+        } else {
+            // SLLI: Shift left, then truncate - combine the two left shifts
+            self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32 + shamt));
+            self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R1, 32));
+        }
+
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // Set less than (register)
+    fn compile_slt(&mut self, rd: Register, rs1: Register, rs2: Register, signed: bool) -> CompilerResult<()> {
+        // For signed comparison, we need sign-extended values
+        // For unsigned comparison, zero-extended (raw) is correct
+        if signed {
+            self.load_rv_reg(SvmRegister::R1, rs1);
+            self.load_rv_reg(SvmRegister::R2, rs2);
+        } else {
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+            self.load_rv_reg_raw(SvmRegister::R2, rs2);
+        }
+
+        // Use conditional jump to set result
+        // r3 = 1 (assume less than)
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, 1));
+
+        if signed {
+            // jslt r1, r2, +1
+            self.output.push(SvmInstruction::jmp_reg(opcodes::JSLT, SvmRegister::R1, SvmRegister::R2, 1));
+        } else {
+            // jlt r1, r2, +1
+            self.output.push(SvmInstruction::jmp_reg(opcodes::JLT, SvmRegister::R1, SvmRegister::R2, 1));
+        }
+
+        // r3 = 0 (not less than)
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, 0));
+
+        self.store_rv_reg(rd, SvmRegister::R3);
+        Ok(())
+    }
+
+    // Set less than immediate
+    fn compile_slti(&mut self, rd: Register, rs1: Register, imm: i32, signed: bool) -> CompilerResult<()> {
+        // For signed comparison, we need sign-extended value
+        // For unsigned comparison, zero-extended (raw) is correct
+        if signed {
+            self.load_rv_reg(SvmRegister::R1, rs1);
+        } else {
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        }
+
+        // r3 = 1 (assume less than)
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, 1));
+
+        if signed {
+            self.output.push(SvmInstruction::jmp_imm(opcodes::JSLT, SvmRegister::R1, imm, 1));
+        } else {
+            // For unsigned, we need to handle sign extension carefully
+            self.output.push(SvmInstruction::jmp_imm(opcodes::JLT, SvmRegister::R1, imm, 1));
+        }
+
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, 0));
+
+        self.store_rv_reg(rd, SvmRegister::R3);
+        Ok(())
+    }
+
+    // Load instructions
+    fn compile_load(&mut self, rd: Register, rs1: Register, imm: i32, size: MemorySize, sign_extend: bool) -> CompilerResult<()> {
+        // Calculate address: base + imm + memory_base
+        let total_offset = imm.wrapping_add(self.config.memory_base as i32);
+
+        // Optimize: if rs1 is x0, just use the immediate as address
+        if rs1 == Register::ZERO {
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, total_offset));
+        } else {
+            // Use raw load for address - no sign extension needed
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+            if total_offset != 0 {
+                self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, total_offset));
+            }
+        }
+
+        // Load value
+        self.output.push(SvmInstruction::ldx(size, SvmRegister::R2, SvmRegister::R1, 0));
+
+        // Sign extend to 32 bits for sub-word loads (byte, half)
+        // Word loads don't need sign extension - lower 32 bits are correct
+        if sign_extend {
+            match size {
+                MemorySize::Byte => {
+                    self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R2, 56));
+                    self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R2, 56));
+                }
+                MemorySize::Half => {
+                    self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R2, 48));
+                    self.output.push(SvmInstruction::arsh64_imm(SvmRegister::R2, 48));
+                }
+                MemorySize::Word | MemorySize::DWord => {
+                    // No sign extension needed - lower 32 bits are already correct
+                }
+            }
+        }
+
+        self.store_rv_reg(rd, SvmRegister::R2);
+        Ok(())
+    }
+
+    // Store instructions
+    fn compile_store(&mut self, rs1: Register, rs2: Register, imm: i32, size: MemorySize) -> CompilerResult<()> {
+        // Calculate address
+        let total_offset = imm.wrapping_add(self.config.memory_base as i32);
+
+        // Optimize: if rs1 is x0, just use the immediate as address
+        if rs1 == Register::ZERO {
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, total_offset));
+        } else {
+            // Use raw load (no sign extension needed for addresses)
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+            if total_offset != 0 {
+                self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, total_offset));
+            }
+        }
+
+        // Load value to store - raw load is fine, we store lower bits
+        self.load_rv_reg_raw(SvmRegister::R2, rs2);
+
+        // Store
+        self.output.push(SvmInstruction::stx(size, SvmRegister::R1, SvmRegister::R2, 0));
+        Ok(())
+    }
+
+    // Branch instructions
+    // Branch with sign-extended loads (for signed comparisons BLT, BGE)
+    fn compile_branch(&mut self, rs1: Register, rs2: Register, imm: i32, jmp_op: u8) -> CompilerResult<()> {
+        // With write-through caching, memory is always up-to-date, so no clear needed
+        self.load_rv_reg(SvmRegister::R1, rs1);
+        self.load_rv_reg(SvmRegister::R2, rs2);
+
+        // Calculate target instruction index
+        // imm is byte offset, divide by 4 to get instruction offset
+        let inst_offset = imm / 4;
+        let target_idx = (self.rv_pc as i32 + inst_offset) as usize;
+
+        // Emit jump with placeholder offset (will be fixed up later)
+        let jmp_idx = self.output.len();
+        self.output.push(SvmInstruction::jmp_reg(jmp_op, SvmRegister::R1, SvmRegister::R2, 0));
+
+        // Record fixup
+        self.branch_fixups.push((jmp_idx, target_idx));
+        Ok(())
+    }
+
+    // Branch with raw loads (for equality BEQ/BNE and unsigned BLTU/BGEU)
+    fn compile_branch_raw(&mut self, rs1: Register, rs2: Register, imm: i32, jmp_op: u8) -> CompilerResult<()> {
+        // With write-through caching, memory is always up-to-date, so no clear needed
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        self.load_rv_reg_raw(SvmRegister::R2, rs2);
+
+        // Calculate target instruction index
+        let inst_offset = imm / 4;
+        let target_idx = (self.rv_pc as i32 + inst_offset) as usize;
+
+        // Emit jump with placeholder offset (will be fixed up later)
+        let jmp_idx = self.output.len();
+        self.output.push(SvmInstruction::jmp_reg(jmp_op, SvmRegister::R1, SvmRegister::R2, 0));
+
+        // Record fixup
+        self.branch_fixups.push((jmp_idx, target_idx));
+        Ok(())
+    }
+
+    // Branch comparing with zero (signed) - optimized to use immediate comparison
+    fn compile_branch_zero(&mut self, rs1: Register, imm: i32, jmp_op: u8) -> CompilerResult<()> {
+        // With write-through caching, memory is always up-to-date, so no clear needed
+        self.load_rv_reg(SvmRegister::R1, rs1);
+
+        // Calculate target instruction index
+        let inst_offset = imm / 4;
+        let target_idx = (self.rv_pc as i32 + inst_offset) as usize;
+
+        // Use immediate comparison with 0 - saves loading a register
+        let jmp_idx = self.output.len();
+        self.output.push(SvmInstruction::jmp_imm(jmp_op, SvmRegister::R1, 0, 0));
+
+        // Record fixup
+        self.branch_fixups.push((jmp_idx, target_idx));
+        Ok(())
+    }
+
+    // Branch comparing with zero (raw/unsigned) - optimized to use immediate comparison
+    fn compile_branch_zero_raw(&mut self, rs1: Register, imm: i32, jmp_op: u8) -> CompilerResult<()> {
+        // With write-through caching, memory is always up-to-date, so no clear needed
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
+
+        // Calculate target instruction index
+        let inst_offset = imm / 4;
+        let target_idx = (self.rv_pc as i32 + inst_offset) as usize;
+
+        // Use immediate comparison with 0 - saves loading a register
+        let jmp_idx = self.output.len();
+        self.output.push(SvmInstruction::jmp_imm(jmp_op, SvmRegister::R1, 0, 0));
+
+        // Record fixup
+        self.branch_fixups.push((jmp_idx, target_idx));
+        Ok(())
+    }
+
+    // JAL instruction
+    fn compile_jal(&mut self, rd: Register, imm: i32) -> CompilerResult<()> {
+        // With write-through caching, memory is always up-to-date, so no clear needed
+        // Save return address (next instruction's address in RISC-V terms)
+        let return_addr = (self.rv_pc + 1) * 4;
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, return_addr as i32));
+        self.store_rv_reg(rd, SvmRegister::R1);
+
+        // Record this as a potential return site (for JALR dispatch)
+        if rd != Register::ZERO {
+            // Only record if we're saving the return address
+            if !self.return_sites.contains(&(self.rv_pc + 1)) {
+                self.return_sites.push(self.rv_pc + 1);
+            }
+        }
+
+        // Calculate target
+        let inst_offset = imm / 4;
+        let target_idx = (self.rv_pc as i32 + inst_offset) as usize;
+
+        // Emit unconditional jump
+        let jmp_idx = self.output.len();
+        self.output.push(SvmInstruction::ja(0));
+
+        self.branch_fixups.push((jmp_idx, target_idx));
+        Ok(())
+    }
+
+    // JALR instruction
+    fn compile_jalr(&mut self, rd: Register, rs1: Register, imm: i32) -> CompilerResult<()> {
+        // With write-through caching, memory is always up-to-date, so no clear needed
+        // Calculate target address in bytes
+        // Raw load is fine - we just need the address value
+        self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        self.output.push(SvmInstruction::add64_imm(SvmRegister::R1, imm));
+        // Clear lowest bit (per RISC-V spec)
+        self.output.push(SvmInstruction::and64_imm(SvmRegister::R1, !1));
+
+        // Save return address (for calls, not returns)
+        if rd != Register::ZERO {
+            let return_addr = ((self.rv_pc + 1) * 4) as i32;
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R2, return_addr));
+            self.store_rv_reg(rd, SvmRegister::R2);
+        }
+
+        // R1 now contains the target byte address
+        // We'll jump to the dispatch table which will handle the dynamic jump
+        // Store jump index for later fixup
+        let jmp_idx = self.output.len();
+        self.output.push(SvmInstruction::ja(0)); // Will be fixed up to point to dispatch table
+        self.jalr_fixups.push(jmp_idx);
+
+        Ok(())
+    }
+
+    // LUI instruction
+    fn compile_lui(&mut self, rd: Register, imm: i32) -> CompilerResult<()> {
+        // imm already has lower 12 bits as 0
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, imm));
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // AUIPC instruction
+    fn compile_auipc(&mut self, rd: Register, imm: i32) -> CompilerResult<()> {
+        // PC + imm (imm is upper 20 bits << 12)
+        let pc_val = (self.rv_pc * 4) as i32;
+        let result = pc_val.wrapping_add(imm);
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, result));
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // ECALL - system call
+    fn compile_ecall(&mut self) -> CompilerResult<()> {
+        // In our model, ecall with a7=93 is exit
+        // Flush cache first so A0 is in memory
+        self.flush_cache();
+        // Load return value from a0 and exit
+        self.load_rv_reg(SvmRegister::R0, Register::A0);
+        self.output.push(SvmInstruction::exit());
+        Ok(())
+    }
+
+    // EBREAK
+    fn compile_ebreak(&mut self) -> CompilerResult<()> {
+        // For now, treat as exit
+        self.output.push(SvmInstruction::exit());
+        Ok(())
+    }
+
+    // CSR instructions (simplified - most CSRs are ignored)
+    fn compile_csr(&mut self, rd: Register, _rs1: Register, _csr: u16) -> CompilerResult<()> {
+        // Return 0 for most CSRs
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    fn compile_csr_imm(&mut self, rd: Register, _csr: u16) -> CompilerResult<()> {
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // MUL instruction - mul32 only uses lower 32 bits, so raw loads work
+    fn compile_mul(&mut self, rd: Register, rs1: Register, rs2: Register) -> CompilerResult<()> {
+        self.load_rv_reg_cached(SvmRegister::R1, rs1);
+        self.load_rv_reg_cached(SvmRegister::R2, rs2);
+        self.output.push(SvmInstruction::mul32_reg(SvmRegister::R1, SvmRegister::R2));
+        // No sign extension needed - mul32 produces correct lower 32 bits
+        self.store_rv_reg_cached(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // MULH, MULHSU, MULHU - get upper 32 bits of multiplication
+    fn compile_mulh(&mut self, rd: Register, rs1: Register, rs2: Register, rs1_signed: bool, rs2_signed: bool) -> CompilerResult<()> {
+        self.load_rv_reg(SvmRegister::R1, rs1);
+        self.load_rv_reg(SvmRegister::R2, rs2);
+
+        // Sign/zero extend based on signedness
+        if rs1_signed {
+            // Already sign-extended by load_rv_reg
+        } else {
+            // Zero-extend: shift left 32, then logical shift right 32
+            self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
+            self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, 32));
+        }
+
+        if rs2_signed {
+            // Already sign-extended by load_rv_reg
+        } else {
+            // Zero-extend
+            self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R2, 32));
+            self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R2, 32));
+        }
+
+        // 64-bit multiply
+        self.output.push(SvmInstruction::mul64_reg(SvmRegister::R1, SvmRegister::R2));
+
+        // Get upper 32 bits - these are already in the lower 32 bits after shift
+        // No sign extension needed - we only store lower 32 bits
+        self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, 32));
+
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // DIV/DIVU instruction
+    fn compile_div(&mut self, rd: Register, rs1: Register, rs2: Register, signed: bool) -> CompilerResult<()> {
+        // For unsigned division, raw loads are fine (div32 uses lower 32 bits)
+        // For signed division, we need sign-extended for overflow check
+        if signed {
+            self.load_rv_reg(SvmRegister::R1, rs1);
+            self.load_rv_reg(SvmRegister::R2, rs2);
+        } else {
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+            self.load_rv_reg_raw(SvmRegister::R2, rs2);
+        }
+
+        // Check for division by zero - return -1 for signed, 0xFFFFFFFF for unsigned
+        self.output.push(SvmInstruction::jmp_imm(opcodes::JNE, SvmRegister::R2, 0, 2));
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, -1));
+        let skip_idx = self.output.len();
+        self.output.push(SvmInstruction::ja(0)); // Will be fixed up
+
+        if signed {
+            // Check for overflow: -2^31 / -1
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, i32::MIN));
+            self.output.push(SvmInstruction::jmp_reg(opcodes::JNE, SvmRegister::R1, SvmRegister::R3, 4));
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, -1));
+            self.output.push(SvmInstruction::jmp_reg(opcodes::JNE, SvmRegister::R2, SvmRegister::R3, 2));
+            // Overflow case: return -2^31
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, i32::MIN));
+            let skip_div_idx = self.output.len();
+            self.output.push(SvmInstruction::ja(0));
+
+            // Normal signed division
+            self.output.push(SvmInstruction::sdiv32_reg(SvmRegister::R1, SvmRegister::R2));
+
+            // Fix up the skip jump
+            let current = self.output.len();
+            self.output.instructions[skip_div_idx].offset = (current - skip_div_idx - 1) as i16;
+        } else {
+            // Unsigned division
+            self.output.push(SvmInstruction::div32_reg(SvmRegister::R1, SvmRegister::R2));
+        }
+
+        // Fix up the division by zero skip
+        let current = self.output.len();
+        self.output.instructions[skip_idx].offset = (current - skip_idx - 1) as i16;
+
+        // No sign extension needed - div32 produces correct lower 32 bits
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // REM/REMU instruction
+    fn compile_rem(&mut self, rd: Register, rs1: Register, rs2: Register, signed: bool) -> CompilerResult<()> {
+        // For unsigned remainder, raw loads are fine (mod32 uses lower 32 bits)
+        // For signed remainder, we need sign-extended for overflow check
+        if signed {
+            self.load_rv_reg(SvmRegister::R1, rs1);
+            self.load_rv_reg(SvmRegister::R2, rs2);
+        } else {
+            self.load_rv_reg_raw(SvmRegister::R1, rs1);
+            self.load_rv_reg_raw(SvmRegister::R2, rs2);
+        }
+
+        // Check for division by zero - return dividend
+        // If R2 != 0, skip 1 instruction (the ja that jumps to end)
+        self.output.push(SvmInstruction::jmp_imm(opcodes::JNE, SvmRegister::R2, 0, 1));
+        let skip_to_end_idx = self.output.len();
+        self.output.push(SvmInstruction::ja(0)); // Skip to end (result is already in R1)
+
+        if signed {
+            // Check for overflow: -2^31 % -1 = 0
+            // First check if R1 == i32::MIN
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, i32::MIN));
+            // If R1 != MIN, skip the overflow check (skip next 4 instructions)
+            self.output.push(SvmInstruction::jmp_reg(opcodes::JNE, SvmRegister::R1, SvmRegister::R3, 4));
+            // R1 == MIN, now check if R2 == -1
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, -1));
+            // If R2 != -1, skip the overflow result (skip next 2 instructions)
+            self.output.push(SvmInstruction::jmp_reg(opcodes::JNE, SvmRegister::R2, SvmRegister::R3, 2));
+            // Overflow case: return 0
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
+            let skip_rem_idx = self.output.len();
+            self.output.push(SvmInstruction::ja(0)); // Jump to end
+
+            // Normal signed remainder using quotient * divisor subtraction method
+            // rem = dividend - (dividend / divisor) * divisor
+
+            // Save dividend in R3
+            self.output.push(SvmInstruction::mov64_reg(SvmRegister::R3, SvmRegister::R1));
+
+            // Compute signed division: R4 = R1 / R2
+            self.output.push(SvmInstruction::sdiv32_reg(SvmRegister::R1, SvmRegister::R2));
+
+            // Compute quotient * divisor: R1 = R1 * R2
+            self.output.push(SvmInstruction::mul32_reg(SvmRegister::R1, SvmRegister::R2));
+
+            // Compute remainder: R1 = R3 - R1 (dividend - quotient * divisor)
+            self.output.push(SvmInstruction::sub32_reg(SvmRegister::R3, SvmRegister::R1));
+            self.output.push(SvmInstruction::mov64_reg(SvmRegister::R1, SvmRegister::R3));
+
+            // Fix up skip jump
+            let current = self.output.len();
+            self.output.instructions[skip_rem_idx].offset = (current - skip_rem_idx - 1) as i16;
+        } else {
+            // Unsigned modulo
+            // Zero-extend operands first
+            self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R1, 32));
+            self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R1, 32));
+            self.output.push(SvmInstruction::lsh64_imm(SvmRegister::R2, 32));
+            self.output.push(SvmInstruction::rsh64_imm(SvmRegister::R2, 32));
+            self.output.push(SvmInstruction::mod64_reg(SvmRegister::R1, SvmRegister::R2));
+        }
+
+        // Fix up division by zero skip
+        let current = self.output.len();
+        self.output.instructions[skip_to_end_idx].offset = (current - skip_to_end_idx - 1) as i16;
+
+        // No sign extension needed - result is in lower 32 bits
+        self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // Fix up branch offsets
+    fn fixup_branches(&mut self) -> CompilerResult<()> {
+        for (jmp_idx, target_rv_idx) in self.branch_fixups.clone() {
+            let target_svm_idx = self.pc_map.get(&target_rv_idx)
+                .ok_or_else(|| CompilerError::InvalidBranchTarget(target_rv_idx as i32))?;
+
+            // Calculate offset: target - (current + 1)
+            let offset = (*target_svm_idx as i64) - (jmp_idx as i64) - 1;
+            if offset < i16::MIN as i64 || offset > i16::MAX as i64 {
+                return Err(CompilerError::InvalidBranchTarget(target_rv_idx as i32));
+            }
+
+            self.output.instructions[jmp_idx].offset = offset as i16;
+        }
+        Ok(())
+    }
+
+    /// Emit return dispatch table for JALR instructions
+    ///
+    /// This creates a series of comparisons against known return sites
+    /// and jumps to the appropriate SVM instruction.
+    fn emit_return_dispatch(&mut self) -> CompilerResult<()> {
+        if self.jalr_fixups.is_empty() {
+            return Ok(());
+        }
+
+        // Record start of dispatch table
+        let dispatch_start = self.output.len();
+
+        // R1 contains the target byte address from JALR
+        // We need to compare against each return site
+
+        // First check for 0 (exit)
+        self.output.push(SvmInstruction::jmp_imm(opcodes::JNE, SvmRegister::R1, 0, 1));
+        self.output.push(SvmInstruction::exit());
+
+        // For each return site, emit comparison and jump
+        for &return_rv_idx in &self.return_sites.clone() {
+            let return_byte_addr = (return_rv_idx * 4) as i32;
+            let target_svm_idx = self.pc_map.get(&return_rv_idx)
+                .ok_or_else(|| CompilerError::InvalidBranchTarget(return_rv_idx as i32))?;
+
+            // Compare R1 with return address
+            self.output.push(SvmInstruction::jmp_imm(opcodes::JNE, SvmRegister::R1, return_byte_addr, 1));
+
+            // Emit jump to target SVM instruction
+            let jmp_idx = self.output.len();
+            self.output.push(SvmInstruction::ja(0));
+
+            // Calculate offset for the jump
+            let offset = (*target_svm_idx as i64) - (jmp_idx as i64) - 1;
+            if offset < i16::MIN as i64 || offset > i16::MAX as i64 {
+                return Err(CompilerError::InvalidBranchTarget(return_rv_idx as i32));
+            }
+            self.output.instructions[jmp_idx].offset = offset as i16;
+        }
+
+        // If no match found, exit (shouldn't happen in well-formed programs)
+        self.output.push(SvmInstruction::exit());
+
+        // Fix up all JALR jumps to point to dispatch table
+        for jmp_idx in &self.jalr_fixups.clone() {
+            let offset = (dispatch_start as i64) - (*jmp_idx as i64) - 1;
+            if offset < i16::MIN as i64 || offset > i16::MAX as i64 {
+                return Err(CompilerError::InvalidBranchTarget(dispatch_start as i32));
+            }
+            self.output.instructions[*jmp_idx].offset = offset as i16;
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for Compiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::svm::SvmVm;
+
+    fn run_rv_program(instructions: &[Instruction]) -> u64 {
+        let mut compiler = Compiler::new();
+        let program = compiler.compile(instructions).unwrap();
+        let mut vm = SvmVm::new(0x20000);
+        vm.set_compute_limit(1_000_000);
+        vm.execute(&program).unwrap()
+    }
+
+    #[test]
+    fn test_simple_return() {
+        // li a0, 42 (addi a0, x0, 42)
+        // ecall (exit)
+        let instructions = vec![
+            Instruction::Addi { rd: Register::A0, rs1: Register::ZERO, imm: 42 },
+            Instruction::Ecall,
+        ];
+        let result = run_rv_program(&instructions);
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_add() {
+        // li a0, 10
+        // li a1, 20
+        // add a0, a0, a1
+        // ecall
+        let instructions = vec![
+            Instruction::Addi { rd: Register::A0, rs1: Register::ZERO, imm: 10 },
+            Instruction::Addi { rd: Register::A1, rs1: Register::ZERO, imm: 20 },
+            Instruction::Add { rd: Register::A0, rs1: Register::A0, rs2: Register::A1 },
+            Instruction::Ecall,
+        ];
+        let result = run_rv_program(&instructions);
+        assert_eq!(result, 30);
+    }
+
+    #[test]
+    fn test_mul() {
+        // li a0, 6
+        // li a1, 7
+        // mul a0, a0, a1
+        // ecall
+        let instructions = vec![
+            Instruction::Addi { rd: Register::A0, rs1: Register::ZERO, imm: 6 },
+            Instruction::Addi { rd: Register::A1, rs1: Register::ZERO, imm: 7 },
+            Instruction::Mul { rd: Register::A0, rs1: Register::A0, rs2: Register::A1 },
+            Instruction::Ecall,
+        ];
+        let result = run_rv_program(&instructions);
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_branch() {
+        // li a0, 5
+        // li a1, 5
+        // beq a0, a1, skip
+        // li a0, 0
+        // skip:
+        // ecall
+        let instructions = vec![
+            Instruction::Addi { rd: Register::A0, rs1: Register::ZERO, imm: 5 },
+            Instruction::Addi { rd: Register::A1, rs1: Register::ZERO, imm: 5 },
+            Instruction::Beq { rs1: Register::A0, rs2: Register::A1, imm: 8 }, // Skip 2 instructions (8 bytes)
+            Instruction::Addi { rd: Register::A0, rs1: Register::ZERO, imm: 0 },
+            Instruction::Ecall,
+        ];
+        let result = run_rv_program(&instructions);
+        assert_eq!(result, 5);
+    }
+}

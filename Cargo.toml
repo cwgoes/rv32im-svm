@@ -1,0 +1,36 @@
+[package]
+name = "rv32im-svm"
+version = "0.1.0"
+edition = "2021"
+description = "RISC-V rv32im to Solana SVM compiler"
+license = "MIT"
+authors = ["RV32IM-SVM Contributors"]
+
+[lib]
+name = "rv32im_svm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rv32im-svm"
+path = "src/main.rs"
+
+[dependencies]
+thiserror = "1.0"
+byteorder = "1.5"
+log = "0.4"
+env_logger = "0.10"
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3.10"
+
+[[bench]]
+name = "factorial"
+harness = false
+
+[[example]]
+name = "factorial_benchmark"
+
+[profile.release]
+opt-level = 3
+lto = true
