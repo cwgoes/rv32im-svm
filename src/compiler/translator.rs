@@ -228,6 +228,10 @@ impl Compiler {
             Srl { rd, rs1, rs2 } => self.compile_shift(rd, rs1, rs2, true, false),
             Sra { rd, rs1, rs2 } => self.compile_shift(rd, rs1, rs2, true, true),
             Slt { rd, rs1, rs2 } => self.compile_slt(rd, rs1, rs2, true),
+            // SLTU rd, rs1, zero: rs1 < 0 (unsigned) = always false
+            Sltu { rd, rs1: _, rs2 } if rs2 == Register::ZERO => self.compile_load_zero(rd),
+            // SLTU rd, zero, rs2: 0 < rs2 (unsigned) = rs2 != 0
+            Sltu { rd, rs1, rs2 } if rs1 == Register::ZERO => self.compile_sltu_zero(rd, rs2),
             Sltu { rd, rs1, rs2 } => self.compile_slt(rd, rs1, rs2, false),
 
             // I-type ALU operations
@@ -327,6 +331,18 @@ impl Compiler {
     fn compile_load_zero(&mut self, rd: Register) -> CompilerResult<()> {
         self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
         self.store_rv_reg(rd, SvmRegister::R1);
+        Ok(())
+    }
+
+    // SLTU rd, zero, rs2: 0 < rs2 (unsigned) = rs2 != 0
+    fn compile_sltu_zero(&mut self, rd: Register, rs: Register) -> CompilerResult<()> {
+        self.load_rv_reg_raw(SvmRegister::R1, rs);
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, 1));
+        // If R1 != 0, skip next instruction (result is 1)
+        self.output.push(SvmInstruction::jmp_imm(opcodes::JNE, SvmRegister::R1, 0, 1));
+        // R1 == 0, result is 0
+        self.output.push(SvmInstruction::mov64_imm(SvmRegister::R3, 0));
+        self.store_rv_reg(rd, SvmRegister::R3);
         Ok(())
     }
 
