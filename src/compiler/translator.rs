@@ -75,6 +75,11 @@ pub struct Compiler {
     return_sites: Vec<usize>,
     /// JALR dispatch fixups: (svm_index) - jump instructions that need dispatch table target
     jalr_fixups: Vec<usize>,
+    /// Register cache: maps SVM register (R5-R8) index to cached RV register
+    /// None means the slot is empty
+    reg_cache: [Option<Register>; 4],
+    /// Dirty flags for cached registers (need writeback)
+    reg_cache_dirty: [bool; 4],
 }
 
 impl Compiler {
@@ -94,6 +99,8 @@ impl Compiler {
             branch_fixups: Vec::new(),
             return_sites: Vec::new(),
             jalr_fixups: Vec::new(),
+            reg_cache: [None; 4],
+            reg_cache_dirty: [false; 4],
         }
     }
 
@@ -105,6 +112,8 @@ impl Compiler {
         self.branch_fixups.clear();
         self.return_sites.clear();
         self.jalr_fixups.clear();
+        self.reg_cache = [None; 4];
+        self.reg_cache_dirty = [false; 4];
 
         // First pass: emit prologue
         self.emit_prologue();
@@ -155,6 +164,8 @@ impl Compiler {
     }
 
     fn emit_epilogue(&mut self) {
+        // Flush any cached registers before exit
+        self.flush_cache();
         // Load return value from a0 (x10) to r0
         self.load_rv_reg(SvmRegister::R0, Register::A0);
         self.output.push(SvmInstruction::exit());
@@ -162,10 +173,20 @@ impl Compiler {
 
     /// Load a RISC-V register value into an SVM register (with sign extension)
     /// Uses R9 as base pointer to register file for efficient indexed access
+    /// Cache-aware: checks cache first before loading from memory
     fn load_rv_reg(&mut self, svm_reg: SvmRegister, rv_reg: Register) {
         if rv_reg == Register::ZERO {
             // x0 is always 0
             self.output.push(SvmInstruction::mov64_imm(svm_reg, 0));
+        } else if let Some(slot) = self.find_in_cache(rv_reg) {
+            // Value is in cache - copy from cache register
+            let cache_reg = self.cache_slot_to_svm(slot);
+            if cache_reg != svm_reg {
+                self.output.push(SvmInstruction::mov64_reg(svm_reg, cache_reg));
+            }
+            // Sign extend from 32-bit to 64-bit
+            self.output.push(SvmInstruction::lsh64_imm(svm_reg, 32));
+            self.output.push(SvmInstruction::arsh64_imm(svm_reg, 32));
         } else {
             // Use R9 (register file base) with offset for indexed load
             let offset = (rv_reg.index() * 4) as i16;
@@ -179,10 +200,18 @@ impl Compiler {
     /// Load a RISC-V register value into an SVM register WITHOUT sign extension
     /// Use this when the value will be used in alu32 operations (which only use lower 32 bits)
     /// This saves 2 instructions per load
+    /// Cache-aware: checks cache first before loading from memory
     fn load_rv_reg_raw(&mut self, svm_reg: SvmRegister, rv_reg: Register) {
         if rv_reg == Register::ZERO {
             // x0 is always 0
             self.output.push(SvmInstruction::mov64_imm(svm_reg, 0));
+        } else if let Some(slot) = self.find_in_cache(rv_reg) {
+            // Value is in cache - copy from cache register
+            let cache_reg = self.cache_slot_to_svm(slot);
+            if cache_reg != svm_reg {
+                self.output.push(SvmInstruction::mov64_reg(svm_reg, cache_reg));
+            }
+            // No sign extension - caller must handle if needed
         } else {
             // Use R9 (register file base) with offset for indexed load
             let offset = (rv_reg.index() * 4) as i16;
@@ -193,6 +222,7 @@ impl Compiler {
 
     /// Store an SVM register value to a RISC-V register
     /// Uses R9 as base pointer to register file for efficient indexed access
+    /// With write-through caching: also updates cache register if present
     fn store_rv_reg(&mut self, rv_reg: Register, svm_reg: SvmRegister) {
         if rv_reg == Register::ZERO {
             // Writes to x0 are ignored
@@ -201,6 +231,208 @@ impl Compiler {
         // Use R9 (register file base) with offset for indexed store
         let offset = (rv_reg.index() * 4) as i16;
         self.output.push(SvmInstruction::stx(MemorySize::Word, SvmRegister::R9, svm_reg, offset));
+
+        // If this register is in cache, update the cache register too
+        if let Some(slot) = self.find_in_cache(rv_reg) {
+            let cache_reg = self.cache_slot_to_svm(slot);
+            if cache_reg != svm_reg {
+                self.output.push(SvmInstruction::mov64_reg(cache_reg, svm_reg));
+            }
+            // Cache is already tracking this register, and it's not dirty (just wrote to memory)
+        }
+    }
+
+    // ========== Register Cache Management ==========
+    // Cache uses SVM R5-R8 to hold frequently-used RV registers
+
+    /// Get SVM register for a cache slot (0-3 -> R5-R8)
+    fn cache_slot_to_svm(&self, slot: usize) -> SvmRegister {
+        match slot {
+            0 => SvmRegister::R5,
+            1 => SvmRegister::R6,
+            2 => SvmRegister::R7,
+            3 => SvmRegister::R8,
+            _ => panic!("Invalid cache slot"),
+        }
+    }
+
+    /// Find if an RV register is in the cache, returns cache slot index
+    fn find_in_cache(&self, rv_reg: Register) -> Option<usize> {
+        for i in 0..4 {
+            if self.reg_cache[i] == Some(rv_reg) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Invalidate a cached register (when it's written via a different path)
+    #[allow(dead_code)]
+    fn invalidate_cached_reg(&mut self, rv_reg: Register) {
+        if let Some(slot) = self.find_in_cache(rv_reg) {
+            self.reg_cache[slot] = None;
+            self.reg_cache_dirty[slot] = false;
+        }
+    }
+
+    /// Flush all dirty cached registers to memory
+    #[allow(dead_code)]
+    fn flush_cache(&mut self) {
+        for i in 0..4 {
+            if let Some(rv_reg) = self.reg_cache[i] {
+                if self.reg_cache_dirty[i] {
+                    let svm_reg = self.cache_slot_to_svm(i);
+                    let offset = (rv_reg.index() * 4) as i16;
+                    self.output.push(SvmInstruction::stx(MemorySize::Word, SvmRegister::R9, svm_reg, offset));
+                    self.reg_cache_dirty[i] = false;
+                }
+            }
+        }
+    }
+
+    /// Clear the entire cache (with write-through, no flush needed)
+    #[allow(dead_code)]
+    fn clear_cache(&mut self) {
+        // With write-through caching, memory is always up-to-date
+        // so we just need to clear the tracking
+        self.reg_cache = [None; 4];
+        self.reg_cache_dirty = [false; 4];
+    }
+
+    /// Load RV register into cache slot, returns the SVM register
+    /// If already cached, returns the cached SVM register
+    /// Evicts LRU slot if cache is full
+    #[allow(dead_code)]
+    fn load_cached(&mut self, rv_reg: Register) -> SvmRegister {
+        if rv_reg == Register::ZERO {
+            // x0 is always 0, use R1 as temp
+            self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, 0));
+            return SvmRegister::R1;
+        }
+
+        // Check if already cached
+        if let Some(slot) = self.find_in_cache(rv_reg) {
+            return self.cache_slot_to_svm(slot);
+        }
+
+        // Find an empty slot or evict
+        let slot = self.find_or_evict_slot();
+        let svm_reg = self.cache_slot_to_svm(slot);
+
+        // Load the value
+        let offset = (rv_reg.index() * 4) as i16;
+        self.output.push(SvmInstruction::ldx(MemorySize::Word, svm_reg, SvmRegister::R9, offset));
+
+        // Update cache state
+        self.reg_cache[slot] = Some(rv_reg);
+        self.reg_cache_dirty[slot] = false;
+
+        svm_reg
+    }
+
+    /// Store to a cached register (marks as dirty)
+    #[allow(dead_code)]
+    fn store_cached(&mut self, rv_reg: Register, value_reg: SvmRegister) {
+        if rv_reg == Register::ZERO {
+            return; // Writes to x0 are ignored
+        }
+
+        // Check if already cached
+        let slot = if let Some(slot) = self.find_in_cache(rv_reg) {
+            slot
+        } else {
+            // Allocate a new slot
+            self.find_or_evict_slot()
+        };
+
+        let svm_reg = self.cache_slot_to_svm(slot);
+
+        // Copy value to cache register if different
+        if value_reg != svm_reg {
+            self.output.push(SvmInstruction::mov64_reg(svm_reg, value_reg));
+        }
+
+        // Update cache state
+        self.reg_cache[slot] = Some(rv_reg);
+        self.reg_cache_dirty[slot] = true;
+    }
+
+    /// Find an empty cache slot or evict one
+    fn find_or_evict_slot(&mut self) -> usize {
+        // First, look for empty slot
+        for i in 0..4 {
+            if self.reg_cache[i].is_none() {
+                return i;
+            }
+        }
+
+        // No empty slot - evict slot 0 (FIFO eviction)
+        // Write back if dirty
+        if self.reg_cache_dirty[0] {
+            if let Some(rv_reg) = self.reg_cache[0] {
+                let offset = (rv_reg.index() * 4) as i16;
+                self.output.push(SvmInstruction::stx(MemorySize::Word, SvmRegister::R9, SvmRegister::R5, offset));
+            }
+        }
+
+        // Clear slot 0 and return it
+        self.reg_cache[0] = None;
+        self.reg_cache_dirty[0] = false;
+        0
+    }
+
+    /// Load RV register value into specified SVM temp register, using cache if available
+    /// This is the cached version of load_rv_reg_raw
+    fn load_rv_reg_cached(&mut self, svm_reg: SvmRegister, rv_reg: Register) {
+        if rv_reg == Register::ZERO {
+            self.output.push(SvmInstruction::mov64_imm(svm_reg, 0));
+            return;
+        }
+
+        // Check if value is in cache
+        if let Some(slot) = self.find_in_cache(rv_reg) {
+            // Copy from cache register to temp register
+            let cache_reg = self.cache_slot_to_svm(slot);
+            if cache_reg != svm_reg {
+                self.output.push(SvmInstruction::mov64_reg(svm_reg, cache_reg));
+            }
+            // If cache_reg == svm_reg, value is already there
+        } else {
+            // Load from memory
+            let offset = (rv_reg.index() * 4) as i16;
+            self.output.push(SvmInstruction::ldx(MemorySize::Word, svm_reg, SvmRegister::R9, offset));
+        }
+    }
+
+    /// Store SVM temp register value to RV register, using write-through cache
+    /// Always writes to memory AND updates cache. This ensures memory is always up-to-date.
+    fn store_rv_reg_cached(&mut self, rv_reg: Register, svm_reg: SvmRegister) {
+        if rv_reg == Register::ZERO {
+            return;
+        }
+
+        // Always write to memory first (write-through)
+        let offset = (rv_reg.index() * 4) as i16;
+        self.output.push(SvmInstruction::stx(MemorySize::Word, SvmRegister::R9, svm_reg, offset));
+
+        // Check if already in cache
+        let slot = if let Some(slot) = self.find_in_cache(rv_reg) {
+            slot
+        } else {
+            // Allocate a cache slot
+            self.find_or_evict_slot()
+        };
+
+        let cache_reg = self.cache_slot_to_svm(slot);
+
+        // Copy value to cache register
+        if svm_reg != cache_reg {
+            self.output.push(SvmInstruction::mov64_reg(cache_reg, svm_reg));
+        }
+
+        // Update cache state (not dirty since already written to memory)
+        self.reg_cache[slot] = Some(rv_reg);
+        self.reg_cache_dirty[slot] = false;
     }
 
     /// Compile a single RISC-V instruction
@@ -382,41 +614,41 @@ impl Compiler {
     }
 
     // R-type using SVM opcodes directly
-    // Uses raw loads since alu32 only uses lower 32 bits
+    // Uses cached loads/stores for better performance in loops
     // No sign extension needed - lower 32 bits are correct and that's what we store
     fn compile_r_type_svm(&mut self, rd: Register, rs1: Register, rs2: Register, op: u8) -> CompilerResult<()> {
-        self.load_rv_reg_raw(SvmRegister::R1, rs1);
-        self.load_rv_reg_raw(SvmRegister::R2, rs2);
+        self.load_rv_reg_cached(SvmRegister::R1, rs1);
+        self.load_rv_reg_cached(SvmRegister::R2, rs2);
         self.output.push(SvmInstruction::alu32_reg(op, SvmRegister::R1, SvmRegister::R2));
-        self.store_rv_reg(rd, SvmRegister::R1);
+        self.store_rv_reg_cached(rd, SvmRegister::R1);
         Ok(())
     }
 
     // I-type ALU operations
-    // Uses raw load since alu32 only uses lower 32 bits
+    // Uses cached loads/stores for better performance in loops
     // No sign extension needed - lower 32 bits are correct and that's what we store
     fn compile_i_type(&mut self, rd: Register, rs1: Register, imm: i32, op: u8) -> CompilerResult<()> {
-        self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        self.load_rv_reg_cached(SvmRegister::R1, rs1);
         self.output.push(SvmInstruction::alu32_imm(op, SvmRegister::R1, imm));
-        self.store_rv_reg(rd, SvmRegister::R1);
+        self.store_rv_reg_cached(rd, SvmRegister::R1);
         Ok(())
     }
 
     // Special handling for ADDI (used for many pseudo-instructions)
     fn compile_i_type_add(&mut self, rd: Register, rs1: Register, imm: i32) -> CompilerResult<()> {
         // Special case: ADDI rd, zero, imm is just loading a constant
-        // This saves 3 instructions compared to the general case
+        // This saves instructions compared to the general case
         if rs1 == Register::ZERO {
             // imm is already sign-extended as i32, just use it directly
             self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, imm));
-            self.store_rv_reg(rd, SvmRegister::R1);
+            self.store_rv_reg_cached(rd, SvmRegister::R1);
             return Ok(());
         }
 
-        self.load_rv_reg_raw(SvmRegister::R1, rs1);
+        self.load_rv_reg_cached(SvmRegister::R1, rs1);
         self.output.push(SvmInstruction::add32_imm(SvmRegister::R1, imm));
         // No sign extension needed - lower 32 bits are correct and that's what we store
-        self.store_rv_reg(rd, SvmRegister::R1);
+        self.store_rv_reg_cached(rd, SvmRegister::R1);
         Ok(())
     }
 
@@ -605,6 +837,7 @@ impl Compiler {
     // Branch instructions
     // Branch with sign-extended loads (for signed comparisons BLT, BGE)
     fn compile_branch(&mut self, rs1: Register, rs2: Register, imm: i32, jmp_op: u8) -> CompilerResult<()> {
+        // With write-through caching, memory is always up-to-date, so no clear needed
         self.load_rv_reg(SvmRegister::R1, rs1);
         self.load_rv_reg(SvmRegister::R2, rs2);
 
@@ -624,6 +857,7 @@ impl Compiler {
 
     // Branch with raw loads (for equality BEQ/BNE and unsigned BLTU/BGEU)
     fn compile_branch_raw(&mut self, rs1: Register, rs2: Register, imm: i32, jmp_op: u8) -> CompilerResult<()> {
+        // With write-through caching, memory is always up-to-date, so no clear needed
         self.load_rv_reg_raw(SvmRegister::R1, rs1);
         self.load_rv_reg_raw(SvmRegister::R2, rs2);
 
@@ -642,6 +876,7 @@ impl Compiler {
 
     // Branch comparing with zero (signed) - optimized to use immediate comparison
     fn compile_branch_zero(&mut self, rs1: Register, imm: i32, jmp_op: u8) -> CompilerResult<()> {
+        // With write-through caching, memory is always up-to-date, so no clear needed
         self.load_rv_reg(SvmRegister::R1, rs1);
 
         // Calculate target instruction index
@@ -659,6 +894,7 @@ impl Compiler {
 
     // Branch comparing with zero (raw/unsigned) - optimized to use immediate comparison
     fn compile_branch_zero_raw(&mut self, rs1: Register, imm: i32, jmp_op: u8) -> CompilerResult<()> {
+        // With write-through caching, memory is always up-to-date, so no clear needed
         self.load_rv_reg_raw(SvmRegister::R1, rs1);
 
         // Calculate target instruction index
@@ -676,6 +912,7 @@ impl Compiler {
 
     // JAL instruction
     fn compile_jal(&mut self, rd: Register, imm: i32) -> CompilerResult<()> {
+        // With write-through caching, memory is always up-to-date, so no clear needed
         // Save return address (next instruction's address in RISC-V terms)
         let return_addr = (self.rv_pc + 1) * 4;
         self.output.push(SvmInstruction::mov64_imm(SvmRegister::R1, return_addr as i32));
@@ -703,6 +940,7 @@ impl Compiler {
 
     // JALR instruction
     fn compile_jalr(&mut self, rd: Register, rs1: Register, imm: i32) -> CompilerResult<()> {
+        // With write-through caching, memory is always up-to-date, so no clear needed
         // Calculate target address in bytes
         // Raw load is fine - we just need the address value
         self.load_rv_reg_raw(SvmRegister::R1, rs1);
@@ -748,6 +986,8 @@ impl Compiler {
     // ECALL - system call
     fn compile_ecall(&mut self) -> CompilerResult<()> {
         // In our model, ecall with a7=93 is exit
+        // Flush cache first so A0 is in memory
+        self.flush_cache();
         // Load return value from a0 and exit
         self.load_rv_reg(SvmRegister::R0, Register::A0);
         self.output.push(SvmInstruction::exit());
@@ -777,11 +1017,11 @@ impl Compiler {
 
     // MUL instruction - mul32 only uses lower 32 bits, so raw loads work
     fn compile_mul(&mut self, rd: Register, rs1: Register, rs2: Register) -> CompilerResult<()> {
-        self.load_rv_reg_raw(SvmRegister::R1, rs1);
-        self.load_rv_reg_raw(SvmRegister::R2, rs2);
+        self.load_rv_reg_cached(SvmRegister::R1, rs1);
+        self.load_rv_reg_cached(SvmRegister::R2, rs2);
         self.output.push(SvmInstruction::mul32_reg(SvmRegister::R1, SvmRegister::R2));
         // No sign extension needed - mul32 produces correct lower 32 bits
-        self.store_rv_reg(rd, SvmRegister::R1);
+        self.store_rv_reg_cached(rd, SvmRegister::R1);
         Ok(())
     }
 

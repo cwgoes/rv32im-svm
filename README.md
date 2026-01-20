@@ -120,23 +120,23 @@ Compilation statistics for various mathematical functions:
 
 | Function | RV32IM Insts | SVM Insts | Expansion | Total CU | Mean CU/Inst |
 |----------|--------------|-----------|-----------|----------|--------------|
-| factorial | 8 | 33 | 4.12x | 1,163 | 48.46 |
-| fibonacci | 13 | 47 | 3.62x | 2,670 | 68.46 |
+| factorial | 8 | 38 | 4.75x | 1,022 | 42.58 |
+| fibonacci | 13 | 55 | 4.23x | 1,806 | 46.31 |
 | gcd | 6 | 41 | 6.83x | 1,149 | 63.83 |
-| power | 7 | 29 | 4.14x | 1,154 | 54.95 |
-| sum_squares | 9 | 37 | 4.11x | 11,196 | 414.67 |
-| isqrt | 8 | 36 | 4.50x | 59,070 | 2,461.25 |
-| modpow | 13 | 71 | 5.46x | 2,201 | 56.44 |
+| power | 7 | 32 | 4.57x | 1,101 | 52.43 |
+| sum_squares | 9 | 42 | 4.67x | 7,818 | 289.56 |
+| isqrt | 8 | 40 | 5.00x | 43,479 | 1,811.62 |
+| modpow | 13 | 78 | 6.00x | 2,076 | 53.23 |
 
 #### Execution Results
 
 | Function | Input | Result | Compute Units |
 |----------|-------|--------|---------------|
-| factorial | 10 | 3,628,800 | 529 |
-| fibonacci | 20 | 6,765 | 1,180 |
+| factorial | 10 | 3,628,800 | 466 |
+| fibonacci | 20 | 6,765 | 792 |
 | gcd | 1071, 462 | 21 | 293 |
-| power | 2^10 | 1,024 | 510 |
-| modpow | 7^20 mod 10^9+7 | 868,674,437 | 785 |
+| power | 2^10 | 1,024 | 487 |
+| modpow | 7^20 mod 10^9+7 | 868,674,437 | 742 |
 
 ### SHA-256 Benchmark
 
@@ -164,15 +164,15 @@ SHA-256("abc") first word: 0xba7816bf ✓
 
 | Metric | Value |
 |--------|-------|
-| Mean instruction expansion | 3.56x - 6.83x |
-| Mean CU per rv32im instruction | 48-68 (control flow) |
+| Mean instruction expansion | 4.23x - 6.83x |
+| Mean CU per rv32im instruction | 42-64 (control flow) |
 | SHA-256 CU per rv32im instruction | 268 (memory-intensive) |
 
 The overhead varies based on the instruction mix:
-- **Control-flow heavy** (branches, jumps): ~50-70 CU/inst
+- **Control-flow heavy** (branches, jumps): ~42-65 CU/inst
 - **Memory-intensive** (many loads/stores): ~270+ CU/inst
 
-This is because each RISC-V register access requires loading/storing from SVM memory.
+The compiler uses write-through register caching to reduce memory access overhead for frequently-used registers, which helps because each RISC-V register access requires loading/storing from SVM memory.
 
 ## Testing
 
