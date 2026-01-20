@@ -225,6 +225,30 @@ riscv64-linux-gnu-gcc -march=rv32im -mabi=ilp32 -O2 -c sha256.c
 SHA-256("abc") first word: 0xba7816bf ✓
 ```
 
+### Meta-Compiler Benchmark
+
+A meta-compilation benchmark running a compiler compiled to rv32im, then to SVM:
+
+1. **Mini compiler** (C) → GCC rv32im cross-compiler
+2. **rv32im binary** (55 instructions) → rv32im-svm compiler
+3. **SVM bytecode** (209 instructions) → SVM interpreter
+4. **Output:** factorial(10) rv32im code (8 instructions)
+
+#### Meta-Compiler Statistics
+
+| Metric | Value |
+|--------|-------|
+| Mini-compiler RISC-V Instructions | 55 |
+| SVM Instructions | 209 |
+| Expansion Ratio | 3.80x |
+| Total Compute Units (100 iterations) | 78,521 |
+| CU per iteration | 785 |
+
+```
+Generated factorial(10) code: all 8 instructions correct ✓
+factorial(10) = 3,628,800 ✓
+```
+
 ### Overall SVM Overhead
 
 | Metric | Value |
@@ -267,6 +291,9 @@ cargo run --example factorial_benchmark
 
 # Run SHA-256 benchmark
 cargo run --example sha256_benchmark
+
+# Run meta-compiler benchmark
+cargo run --example meta_compiler_benchmark
 ```
 
 ## Project Structure
@@ -293,12 +320,17 @@ rv32im-svm/
 ├── benches/
 │   └── factorial.rs    # Factorial benchmark
 ├── examples/
-│   ├── factorial_benchmark.rs   # Mathematical functions benchmark
-│   └── sha256_benchmark.rs      # SHA-256 real-world benchmark
-└── sha256_benchmark/            # SHA-256 C source files
-    ├── sha256.c                 # SHA-256 implementation
-    ├── start.S                  # Startup assembly
-    └── link.ld                  # Linker script
+│   ├── factorial_benchmark.rs       # Mathematical functions benchmark
+│   ├── sha256_benchmark.rs          # SHA-256 real-world benchmark
+│   └── meta_compiler_benchmark.rs   # Meta-compilation benchmark
+├── sha256_benchmark/                # SHA-256 C source files
+│   ├── sha256.c                     # SHA-256 implementation
+│   ├── start.S                      # Startup assembly
+│   └── link.ld                      # Linker script
+└── meta_compiler/                   # Meta-compiler C source files
+    ├── mini_compiler.c              # Minimal rv32im encoder
+    ├── start.S                      # Startup assembly
+    └── link.ld                      # Linker script
 ```
 
 ## Limitations
